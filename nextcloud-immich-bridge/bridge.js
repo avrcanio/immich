@@ -13,7 +13,7 @@ const config = {
   dryRun: parseBoolean(env('BRIDGE_DRY_RUN', 'true')),
   defaultEmailDomain: env('BRIDGE_DEFAULT_EMAIL_DOMAIN', 'local.invalid'),
   passwordLength: parseInteger(env('BRIDGE_PASSWORD_LENGTH', '24'), 24),
-  libraryNamePrefix: env('BRIDGE_LIBRARY_NAME_PREFIX', 'Nextcloud Photos - '),
+  libraryNamePrefix: env('BRIDGE_LIBRARY_NAME_PREFIX', 'Nextcloud Photos -'),
 };
 
 const credentialsPath = path.join(config.stateDir, 'credentials.json');
@@ -156,7 +156,7 @@ async function runSync(report) {
       userId = updatedUser.id;
     }
 
-    const desiredLibraryName = `${config.libraryNamePrefix}${discovered.nextcloudUserId}`;
+    const desiredLibraryName = `${config.libraryNamePrefix} ${discovered.nextcloudUserId}`;
     const desiredImportPath = discovered.libraryPath;
     const existingLibrary = libraries.find((library) => {
       const sameOwner = library.ownerId === userId;

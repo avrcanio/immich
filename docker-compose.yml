@@ -3,7 +3,10 @@ name: immich
 services:
   immich-server:
     container_name: immich_server
-    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-v2}
+    build:
+      context: ./immich-server-patched
+      args:
+        IMMICH_VERSION: ${IMMICH_VERSION:-v2}
     volumes:
       - ${UPLOAD_LOCATION}:/data
       - /opt/stacks/nextcloud/docker-data/nextcloud/data:/external-libraries/nextcloud-data:ro

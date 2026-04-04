@@ -64,6 +64,18 @@ The compose file joins the external Docker network:
 
 Before changing routing labels, verify the `proxy` network still exists and avoid editing Nextcloud routing unless the task explicitly spans both stacks.
 
+Important secret location:
+
+- Traefik's Cloudflare ACME credentials are not stored in this workspace.
+- They are currently defined in `/opt/stacks/traefik/.env`.
+- The Immich `.env` only references the resolver name via `TRAEFIK_CERT_RESOLVER=cloudflare`.
+
+Important distinction:
+
+- The Cloudflare token in the Traefik stack is used for ACME DNS challenge and certificate issuance.
+- That does not automatically create the public DNS record for `media.finestar.hr`.
+- The DNS record itself must exist in Cloudflare and point to the server or proxy entrypoint used by Traefik.
+
 ## Database
 
 This stack uses its own PostgreSQL container:

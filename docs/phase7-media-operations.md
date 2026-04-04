@@ -39,6 +39,7 @@ Environment defaults are conservative:
 - `MEDIA_OPS_WRITEBACK_ENABLED=false`
 - `MEDIA_OPS_DELETE_ENABLED=false`
 - `MEDIA_OPS_FOLDER_MOVE_ENABLED=false`
+- `MEDIA_OPS_NEXTCLOUD_ALBUM_WRITEBACK_ENABLED=false`
 
 That means:
 
@@ -97,6 +98,38 @@ The service writes:
 
 `operations-state.json` stores staged trash batches for later confirmation.
 
+## Verified Live Smoke Tests
+
+The service itself remains deployed with `MEDIA_OPS_DRY_RUN=true`, but the following live smoke tests were verified by running one-off commands with `MEDIA_OPS_DRY_RUN=false` and then immediately restoring state:
+
+- `update-asset-metadata`
+  - verified with a real `ante@vitalgroupsa.com` asset by toggling `isFavorite`
+  - confirmed through the Immich API that the change was applied
+  - immediately restored the original `isFavorite` value
+- `create-album`
+  - verified with a real `ante@vitalgroupsa.com` asset
+  - confirmed the album appeared in the user's album list
+  - confirmed the requested asset was present in the created album
+  - immediately deleted the album and confirmed it no longer appeared in the user's album list
+
+## Nextcloud Album Writeback v1
+
+- Immich remains the source of truth for albums.
+- In live mode, `create-album` and `add-assets-to-album` can optionally write through to native Nextcloud Photos albums.
+- The write-through uses local `occ` commands in the `nextcloud` container:
+  - `photos:albums:create`
+  - `photos:albums:add`
+- Only assets that map cleanly from:
+  - `/external-libraries/nextcloud-data/<user>/files/...`
+  - to user-relative Nextcloud paths such as `Photos/...`
+  are eligible for Nextcloud album writeback.
+- If an asset is not mappable into the user's Nextcloud `files` tree, the Immich mutation still succeeds and the result is returned as `partial_failure` for the Nextcloud writeback portion.
+- The response payload for live album operations now includes:
+  - `immichApplied`
+  - `nextcloudWritebackApplied`
+  - `nextcloudWritebackStatus`
+  - `nextcloudWritebackErrors`
+
 ## Known Gaps
 
 - EXIF/XMP writeback is still a planned operation, not a live worker yet.
@@ -104,12 +137,13 @@ The service writes:
 - Confirmed delete does not perform hard delete unless explicit live flags are enabled.
 - There is no external auth layer in front of the operations API yet.
 - There is no queue worker split yet; this is a single-service v1 skeleton.
+- Album rename, remove-membership, and delete are not yet written back to Nextcloud.
 
 ## Next Logical Step
 
 The best first live vertical slice after this skeleton is:
 
-1. real `create-album`
-2. real `update-asset-metadata`
-3. sidecar writeback worker for a narrow metadata subset
-4. staged trash restore / confirm flow
+1. live Nextcloud album writeback verification for `create-album`
+2. live Nextcloud album writeback verification for `add-assets-to-album`
+3. album rename/remove/delete writeback
+4. sidecar writeback worker for a narrow metadata subset

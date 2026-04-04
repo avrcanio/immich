@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 const crypto = require('node:crypto');
+const { execFileSync } = require('node:child_process');
 
 const config = {
   port: parseInteger(env('MEDIA_OPS_PORT', '8091'), 8091),
@@ -15,6 +16,8 @@ const config = {
   writebackEnabled: parseBoolean(env('MEDIA_OPS_WRITEBACK_ENABLED', 'false')),
   deleteEnabled: parseBoolean(env('MEDIA_OPS_DELETE_ENABLED', 'false')),
   folderMoveEnabled: parseBoolean(env('MEDIA_OPS_FOLDER_MOVE_ENABLED', 'false')),
+  nextcloudAlbumWritebackEnabled: parseBoolean(env('MEDIA_OPS_NEXTCLOUD_ALBUM_WRITEBACK_ENABLED', 'false')),
+  nextcloudContainerName: env('MEDIA_OPS_NEXTCLOUD_CONTAINER_NAME', 'nextcloud'),
 };
 
 const managedStatePath = path.join(config.bridgeStateDir, 'managed-state.json');
@@ -58,6 +61,8 @@ async function serve() {
           writebackEnabled: config.writebackEnabled,
           deleteEnabled: config.deleteEnabled,
           folderMoveEnabled: config.folderMoveEnabled,
+          nextcloudAlbumWritebackEnabled: config.nextcloudAlbumWritebackEnabled,
+          nextcloudContainerName: config.nextcloudContainerName,
         });
       }
 
@@ -90,6 +95,8 @@ function getCapabilities() {
     writebackEnabled: config.writebackEnabled,
     deleteEnabled: config.deleteEnabled,
     folderMoveEnabled: config.folderMoveEnabled,
+    nextcloudAlbumWritebackEnabled: config.nextcloudAlbumWritebackEnabled,
+    nextcloudContainerName: config.nextcloudContainerName,
     supported: [
       'create-album',
       'update-album',
@@ -163,10 +170,16 @@ async function handleCreateAlbum(payload) {
   }
 
   const created = await immichRequest(context.accessToken, 'POST', '/albums', dto);
+  const nextcloudWriteback = await syncNextcloudAlbumWriteback(context, dto.albumName, dto.assetIds);
   return finalizeResult('create-album', payload, context, {
     albumId: created.id,
     applied: true,
+    immichApplied: true,
     immichResponse: created,
+    nextcloudWritebackApplied: nextcloudWriteback.applied,
+    nextcloudWritebackStatus: nextcloudWriteback.status,
+    nextcloudWritebackErrors: nextcloudWriteback.errors,
+    nextcloudWriteback,
   });
 }
 
@@ -254,12 +267,24 @@ async function handleAddAssetsToAlbum(payload) {
   }
 
   const updated = await immichRequest(context.accessToken, 'PUT', `/albums/${albumId}/assets`, { ids: assetIds });
+  const album = await immichRequest(context.accessToken, 'GET', `/albums/${albumId}`);
+  const nextcloudWriteback = await syncNextcloudAlbumWriteback(
+    context,
+    resolveAlbumName(album, albumId),
+    assetIds,
+    validation,
+  );
   return finalizeResult('add-assets-to-album', payload, context, {
     albumId,
     assetIds,
     validation,
     applied: true,
+    immichApplied: true,
     immichResponse: updated,
+    nextcloudWritebackApplied: nextcloudWriteback.applied,
+    nextcloudWritebackStatus: nextcloudWriteback.status,
+    nextcloudWritebackErrors: nextcloudWriteback.errors,
+    nextcloudWriteback,
   });
 }
 
@@ -499,6 +524,165 @@ function buildUserDestinationPath(context, destinationRelative) {
     throw new Error('Destination path escapes the user library root');
   }
   return destinationPath;
+}
+
+async function syncNextcloudAlbumWriteback(context, albumName, assetIds = [], validation = null) {
+  if (!config.nextcloudAlbumWritebackEnabled) {
+    return {
+      attempted: false,
+      applied: false,
+      status: 'disabled',
+      errors: [],
+      albumName,
+      containerName: config.nextcloudContainerName,
+    };
+  }
+
+  const result = {
+    attempted: true,
+    applied: false,
+    status: 'success',
+    errors: [],
+    albumName,
+    containerName: config.nextcloudContainerName,
+    createAlbum: null,
+    assetAdds: [],
+  };
+
+  result.createAlbum = runNextcloudAlbumCreate(context.nextcloudUserId, albumName);
+
+  if (result.createAlbum.status === 'error') {
+    result.status = 'failed';
+    result.errors.push(result.createAlbum.message);
+    return result;
+  }
+
+  const assetValidation = validation || (assetIds.length > 0 ? await validateAssetsOwned(context, assetIds) : { assets: [] });
+
+  for (const asset of assetValidation.assets) {
+    const relativePath = buildNextcloudRelativeAssetPath(context, asset.originalPath);
+
+    if (!relativePath) {
+      result.status = 'partial_failure';
+      result.errors.push(`Asset ${asset.id} is not within the user's Nextcloud Photos path: ${asset.originalPath}`);
+      result.assetAdds.push({
+        assetId: asset.id,
+        relativePath: null,
+        status: 'unmappable',
+      });
+      continue;
+    }
+
+    const addResult = runNextcloudAlbumAdd(context.nextcloudUserId, albumName, relativePath);
+    result.assetAdds.push({
+      assetId: asset.id,
+      relativePath,
+      status: addResult.status,
+      message: addResult.message,
+    });
+
+    if (addResult.status === 'error') {
+      result.status = 'partial_failure';
+      result.errors.push(addResult.message);
+    }
+  }
+
+  result.applied = result.status === 'success' || result.status === 'partial_failure';
+  return result;
+}
+
+function buildNextcloudRelativeAssetPath(context, originalPath) {
+  const filesRoot = `${path.posix.join(config.sourceRoot, context.nextcloudUserId, 'files')}/`;
+  if (!originalPath.startsWith(filesRoot)) {
+    return null;
+  }
+
+  const relativePath = originalPath.slice(filesRoot.length);
+  if (
+    !relativePath ||
+    relativePath.startsWith('/') ||
+    relativePath.includes('/../') ||
+    relativePath === '..' ||
+    !(relativePath === 'Photos' || relativePath.startsWith('Photos/'))
+  ) {
+    return null;
+  }
+
+  return relativePath;
+}
+
+function runNextcloudAlbumCreate(nextcloudUserId, albumName) {
+  const command = ['exec', '-u', 'www-data', config.nextcloudContainerName, 'php', 'occ', 'photos:albums:create', nextcloudUserId, albumName];
+  return runNextcloudOcc(command, {
+    successStatus: 'created',
+    idempotentPatterns: [/already exists/i],
+    idempotentStatus: 'already_exists',
+  });
+}
+
+function runNextcloudAlbumAdd(nextcloudUserId, albumName, relativePath) {
+  const command = ['exec', '-u', 'www-data', config.nextcloudContainerName, 'php', 'occ', 'photos:albums:add', nextcloudUserId, albumName, relativePath];
+  return runNextcloudOcc(command, {
+    successStatus: 'added',
+    idempotentPatterns: [/already.*album/i, /already in album/i, /unique violation/i, /duplicate key value/i, /paf_album_file/i],
+    idempotentStatus: 'already_present',
+  });
+}
+
+function runNextcloudOcc(command, options) {
+  const successStatus = options.successStatus;
+  const idempotentPatterns = options.idempotentPatterns || [];
+  const idempotentStatus = options.idempotentStatus || 'already_exists';
+
+  try {
+    const stdout = execFileSync('docker', command, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return {
+      status: successStatus,
+      message: sanitizeOccOutput(stdout) || successStatus,
+    };
+  } catch (error) {
+    const combinedOutput = sanitizeOccOutput(`${error.stdout || ''}\n${error.stderr || ''}`);
+    if (idempotentPatterns.some((pattern) => pattern.test(combinedOutput))) {
+      return {
+        status: idempotentStatus,
+        message: combinedOutput || idempotentStatus,
+      };
+    }
+
+    return {
+      status: 'error',
+      message: combinedOutput || String(error.message || error),
+    };
+  }
+}
+
+function sanitizeOccOutput(rawOutput) {
+  return String(rawOutput || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => {
+      if (!line) {
+        return false;
+      }
+      return !(
+        line.startsWith('WARNING:') ||
+        line.startsWith('DETAIL:') ||
+        line.startsWith('HINT:')
+      );
+    })
+    .join('\n')
+    .trim();
+}
+
+function resolveAlbumName(album, albumId) {
+  const albumName = album?.albumName || album?.name || null;
+  if (!albumName) {
+    throw new Error(`Unable to resolve album name for ${albumId}`);
+  }
+  return albumName;
 }
 
 function persistOperation(result) {

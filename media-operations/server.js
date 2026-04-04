@@ -469,7 +469,8 @@ async function createUserContext(nextcloudUserId) {
     throw new Error(`Unknown managed user: ${nextcloudUserId}`);
   }
 
-  if (!stateEntry.libraryPath || !stateEntry.immichUserId || !stateEntry.email) {
+  const preferredLibrary = resolvePreferredLibraryState(stateEntry);
+  if (!preferredLibrary?.libraryPath || !stateEntry.immichUserId || !stateEntry.email) {
     throw new Error(`Managed user is missing bridge identity data: ${nextcloudUserId}`);
   }
 
@@ -478,10 +479,22 @@ async function createUserContext(nextcloudUserId) {
     nextcloudUserId,
     immichEmail: stateEntry.email,
     immichUserId: stateEntry.immichUserId,
-    libraryPath: stateEntry.libraryPath,
-    libraryName: stateEntry.libraryName || null,
+    libraryPath: preferredLibrary.libraryPath,
+    libraryName: preferredLibrary.libraryName || null,
     accessToken,
   };
+}
+
+function resolvePreferredLibraryState(stateEntry) {
+  if (stateEntry.libraryPath) {
+    return {
+      libraryPath: stateEntry.libraryPath,
+      libraryName: stateEntry.libraryName || null,
+    };
+  }
+
+  const libraries = stateEntry.libraries && typeof stateEntry.libraries === 'object' ? stateEntry.libraries : {};
+  return libraries.photos || Object.values(libraries)[0] || null;
 }
 
 async function validateAssetsOwned(context, assetIds) {

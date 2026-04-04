@@ -14,52 +14,32 @@ const config = {
   defaultEmailDomain: env('BRIDGE_DEFAULT_EMAIL_DOMAIN', 'local.invalid'),
   passwordLength: parseInteger(env('BRIDGE_PASSWORD_LENGTH', '24'), 24),
   libraryNamePrefix: env('BRIDGE_LIBRARY_NAME_PREFIX', 'Nextcloud Photos -'),
+  disableCandidateThreshold: parseInteger(env('BRIDGE_DISABLE_CANDIDATE_THRESHOLD', '3'), 3),
 };
 
 const credentialsPath = path.join(config.stateDir, 'credentials.json');
 const reportPath = path.join(config.stateDir, 'last-run.json');
+const managedStatePath = path.join(config.stateDir, 'managed-state.json');
+const deprovisionReportPath = path.join(config.stateDir, 'last-deprovision.json');
 const placeholderApiKey = 'REPLACE_WITH_IMMICH_ADMIN_API_KEY';
 
 fs.mkdirSync(config.stateDir, { recursive: true });
 
 async function main() {
-  log('bridge starting');
+  const { command, args } = parseCommand(process.argv.slice(2));
+
+  if (command === 'deprovision') {
+    await runDeprovision(args);
+    return;
+  }
+
+  const runOnce = command === 'sync-once' ? true : command === 'sync-loop' ? false : config.runOnce;
+
+  log(`bridge starting in ${runOnce ? 'sync-once' : 'sync-loop'} mode`);
 
   do {
     const startedAt = new Date().toISOString();
-    const report = {
-      startedAt,
-      finishedAt: null,
-      dryRun: shouldDryRun(),
-      sourceRoot: config.sourceRoot,
-      summary: {
-        eligible: 0,
-        appdataSkipped: 0,
-        missingPhotos: 0,
-        dryRunCandidates: 0,
-        usersCreated: 0,
-        usersUpdated: 0,
-        librariesCreated: 0,
-        librariesUpdated: 0,
-        librariesScanned: 0,
-        mismatches: 0,
-        errors: 0,
-      },
-      usersDiscovered: 0,
-      usersProcessed: 0,
-      eligibleUsers: [],
-      appdataSkipped: [],
-      missingPhotos: [],
-      dryRunCandidates: [],
-      usersCreated: [],
-      usersUpdated: [],
-      librariesCreated: [],
-      librariesUpdated: [],
-      librariesScanned: [],
-      mismatches: [],
-      skipped: [],
-      errors: [],
-    };
+    const report = createReport(startedAt, runOnce ? 'sync-once' : 'sync-loop');
 
     try {
       await runSync(report);
@@ -68,18 +48,13 @@ async function main() {
       log(`cycle failed: ${error.message}`);
     }
 
-    report.finishedAt = new Date().toISOString();
-    report.summary.usersCreated = report.usersCreated.length;
-    report.summary.usersUpdated = report.usersUpdated.length;
-    report.summary.librariesCreated = report.librariesCreated.length;
-    report.summary.librariesUpdated = report.librariesUpdated.length;
-    report.summary.librariesScanned = report.librariesScanned.length;
-    report.summary.mismatches = report.mismatches.length;
-    report.summary.errors = report.errors.length;
+    finalizeReport(report);
     fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
-    log(`cycle finished: processed=${report.usersProcessed}, createdUsers=${report.usersCreated.length}, createdLibraries=${report.librariesCreated.length}, errors=${report.errors.length}`);
+    log(
+      `cycle finished: processed=${report.usersProcessed}, createdUsers=${report.usersCreated.length}, createdLibraries=${report.librariesCreated.length}, mismatches=${report.mismatches.length}, errors=${report.errors.length}`,
+    );
 
-    if (config.runOnce) {
+    if (runOnce) {
       break;
     }
 
@@ -87,9 +62,76 @@ async function main() {
   } while (true);
 }
 
+function createReport(startedAt, mode) {
+  return {
+    startedAt,
+    finishedAt: null,
+    mode,
+    dryRun: shouldDryRun(),
+    sourceRoot: config.sourceRoot,
+    disableCandidateThreshold: config.disableCandidateThreshold,
+    summary: {
+      nextcloudDirectories: 0,
+      managedUsers: 0,
+      eligible: 0,
+      appdataSkipped: 0,
+      missingPhotos: 0,
+      dryRunCandidates: 0,
+      usersCreated: 0,
+      usersUpdated: 0,
+      librariesCreated: 0,
+      librariesUpdated: 0,
+      librariesScanned: 0,
+      mismatches: 0,
+      disabledCandidates: 0,
+      skipped: 0,
+      errors: 0,
+    },
+    usersDiscovered: 0,
+    usersProcessed: 0,
+    nextcloudDirectories: [],
+    eligibleUsers: [],
+    appdataSkipped: [],
+    missingPhotos: [],
+    dryRunCandidates: [],
+    usersCreated: [],
+    usersUpdated: [],
+    librariesCreated: [],
+    librariesUpdated: [],
+    librariesScanned: [],
+    mismatches: [],
+    disabledCandidates: [],
+    lifecycle: [],
+    skipped: [],
+    errors: [],
+  };
+}
+
+function finalizeReport(report) {
+  report.finishedAt = new Date().toISOString();
+  report.summary.usersCreated = report.usersCreated.length;
+  report.summary.usersUpdated = report.usersUpdated.length;
+  report.summary.librariesCreated = report.librariesCreated.length;
+  report.summary.librariesUpdated = report.librariesUpdated.length;
+  report.summary.librariesScanned = report.librariesScanned.length;
+  report.summary.mismatches = report.mismatches.length;
+  report.summary.disabledCandidates = report.disabledCandidates.length;
+  report.summary.skipped = report.skipped.length;
+  report.summary.errors = report.errors.length;
+}
+
 async function runSync(report) {
-  const discoveredUsers = discoverUsers(report);
+  const discovery = discoverUsers(report);
+  const discoveredUsers = discovery.eligibleUsers;
+  const directoryUserIds = new Set(discovery.directoryUserIds);
+  const eligibleUserIds = new Set(discoveredUsers.map((user) => user.nextcloudUserId));
+  const missingPhotosIds = new Set(report.missingPhotos.map((user) => user.nextcloudUserId));
+
   report.usersDiscovered = discoveredUsers.length;
+
+  const credentials = normalizeCredentials(loadJson(credentialsPath, {}));
+  const managedState = normalizeManagedState(loadJson(managedStatePath, { users: {} }));
+  report.summary.managedUsers = countManagedUsers(credentials, managedState);
 
   if (shouldDryRun()) {
     for (const user of discoveredUsers) {
@@ -102,26 +144,58 @@ async function runSync(report) {
         immichEmail: user.immichEmail,
       });
     }
+
     report.summary.dryRunCandidates = report.dryRunCandidates.length;
+    updateMismatchLifecycle({
+      report,
+      credentials,
+      managedState,
+      directoryUserIds,
+      eligibleUserIds,
+      missingPhotosIds,
+      users: [],
+      libraries: [],
+      now: new Date().toISOString(),
+    });
+    fs.writeFileSync(managedStatePath, JSON.stringify(managedState, null, 2));
     return;
   }
 
   const users = await immichGet('/admin/users');
   const libraries = await immichGet('/libraries');
-  const credentials = loadJson(credentialsPath, {});
+  const now = new Date().toISOString();
 
   for (const discovered of discoveredUsers) {
     report.usersProcessed += 1;
 
-    const existingUser = users.find((user) => user.email === discovered.immichEmail);
+    const stateEntry = ensureManagedStateEntry(managedState, discovered.nextcloudUserId);
+    if (stateEntry.status === 'deprovisioned') {
+      report.skipped.push({
+        type: 'manual_deprovision',
+        nextcloudUserId: discovered.nextcloudUserId,
+        immichEmail: discovered.immichEmail,
+        libraryPath: discovered.libraryPath,
+      });
+      report.lifecycle.push(buildLifecycleRecord(discovered.nextcloudUserId, stateEntry, 'manual_deprovision'));
+      continue;
+    }
+
+    let existingUser = users.find((user) => user.email === discovered.immichEmail);
     let userId = existingUser?.id;
 
     if (!existingUser) {
+      report.mismatches.push({
+        type: 'missing_immich_user',
+        nextcloudUserId: discovered.nextcloudUserId,
+        immichEmail: discovered.immichEmail,
+        resolution: 'create-user',
+      });
+
       const generatedPassword = generatePassword(config.passwordLength);
       credentials[discovered.nextcloudUserId] = {
         email: discovered.immichEmail,
         password: generatedPassword,
-        createdAt: new Date().toISOString(),
+        createdAt: now,
       };
 
       const createdUser = await immichPost('/admin/users', {
@@ -134,6 +208,7 @@ async function runSync(report) {
       });
 
       userId = createdUser.id;
+      existingUser = createdUser;
       users.push(createdUser);
       report.usersCreated.push({
         nextcloudUserId: discovered.nextcloudUserId,
@@ -148,6 +223,7 @@ async function runSync(report) {
       if (index !== -1) {
         users[index] = updatedUser;
       }
+      existingUser = updatedUser;
       report.usersUpdated.push({
         nextcloudUserId: discovered.nextcloudUserId,
         immichUserId: existingUser.id,
@@ -158,15 +234,26 @@ async function runSync(report) {
 
     const desiredLibraryName = `${config.libraryNamePrefix} ${discovered.nextcloudUserId}`;
     const desiredImportPath = discovered.libraryPath;
-    const existingLibrary = libraries.find((library) => {
-      const sameOwner = library.ownerId === userId;
-      const importPaths = Array.isArray(library.importPaths) ? library.importPaths : [];
-      return sameOwner && importPaths.includes(desiredImportPath);
-    });
+    const stateLibrary = stateEntry.libraryId ? libraries.find((library) => library.id === stateEntry.libraryId) : null;
+    const existingLibrary =
+      stateLibrary ||
+      libraries.find((library) => {
+        const sameOwner = library.ownerId === userId;
+        const importPaths = Array.isArray(library.importPaths) ? library.importPaths : [];
+        return sameOwner && importPaths.includes(desiredImportPath);
+      });
 
     let libraryId = existingLibrary?.id;
 
     if (!existingLibrary) {
+      report.mismatches.push({
+        type: 'missing_library',
+        nextcloudUserId: discovered.nextcloudUserId,
+        immichEmail: discovered.immichEmail,
+        libraryPath: desiredImportPath,
+        resolution: 'create-library',
+      });
+
       const createdLibrary = await immichPost('/libraries', {
         ownerId: userId,
         name: desiredLibraryName,
@@ -201,30 +288,113 @@ async function runSync(report) {
         if (index !== -1) {
           libraries[index] = updatedLibrary;
         }
+        libraryId = updatedLibrary.id;
         report.librariesUpdated.push({
           nextcloudUserId: discovered.nextcloudUserId,
-          libraryId: existingLibrary.id,
+          libraryId: updatedLibrary.id,
+          fields: ['name', 'importPaths', 'exclusionPatterns'],
         });
-        libraryId = updatedLibrary.id;
       }
     }
 
-    if (libraryId) {
-      await immichPost(`/libraries/${libraryId}/scan`, {});
+    stateEntry.email = discovered.immichEmail;
+    stateEntry.immichUserId = userId;
+    stateEntry.libraryId = libraryId || stateEntry.libraryId || null;
+    stateEntry.libraryPath = desiredImportPath;
+    stateEntry.libraryName = desiredLibraryName;
+    stateEntry.lastSeenAt = now;
+    stateEntry.lastSyncedAt = now;
+    stateEntry.lastHealthyAt = now;
+    stateEntry.lastMismatchAt = null;
+    stateEntry.lastMismatchType = null;
+    stateEntry.consecutiveMissingCycles = 0;
+    stateEntry.disabledCandidateSince = null;
+    stateEntry.scanPolicy = 'enabled';
+    stateEntry.status = 'active';
+
+    if (stateEntry.libraryId) {
+      await immichPost(`/libraries/${stateEntry.libraryId}/scan`, {});
       report.librariesScanned.push({
         nextcloudUserId: discovered.nextcloudUserId,
-        libraryId,
+        libraryId: stateEntry.libraryId,
       });
     }
+
+    report.lifecycle.push(buildLifecycleRecord(discovered.nextcloudUserId, stateEntry, 'synced'));
   }
 
-  fs.writeFileSync(credentialsPath, JSON.stringify(credentials, null, 2));
+  updateMismatchLifecycle({
+    report,
+    credentials,
+    managedState,
+    directoryUserIds,
+    eligibleUserIds,
+    missingPhotosIds,
+    users,
+    libraries,
+    now,
+  });
 
-  const expectedUsers = new Set(discoveredUsers.map((user) => user.immichEmail));
+  report.summary.managedUsers = countManagedUsers(credentials, managedState);
+  fs.writeFileSync(credentialsPath, JSON.stringify(credentials, null, 2));
+  fs.writeFileSync(managedStatePath, JSON.stringify(managedState, null, 2));
+}
+
+function updateMismatchLifecycle({
+  report,
+  credentials,
+  managedState,
+  directoryUserIds,
+  eligibleUserIds,
+  missingPhotosIds,
+  users,
+  libraries,
+  now,
+}) {
+  const managedUserIds = new Set([
+    ...Object.keys(credentials),
+    ...Object.keys(managedState.users || {}),
+  ]);
+
+  for (const nextcloudUserId of managedUserIds) {
+    const stateEntry = ensureManagedStateEntry(managedState, nextcloudUserId);
+    if (stateEntry.status === 'deprovisioned') {
+      report.lifecycle.push(buildLifecycleRecord(nextcloudUserId, stateEntry, 'deprovisioned'));
+      continue;
+    }
+
+    if (eligibleUserIds.has(nextcloudUserId)) {
+      continue;
+    }
+
+    const mismatchType = directoryUserIds.has(nextcloudUserId) ? 'missing_photos_path' : 'missing_nextcloud_user';
+    const library = stateEntry.libraryId ? libraries.find((candidate) => candidate.id === stateEntry.libraryId) : null;
+    const immichUser = stateEntry.immichUserId ? users.find((candidate) => candidate.id === stateEntry.immichUserId) : null;
+    registerManagedMismatch(report, stateEntry, {
+      nextcloudUserId,
+      mismatchType,
+      now,
+      immichEmail: stateEntry.email || credentials[nextcloudUserId]?.email || null,
+      immichUserId: stateEntry.immichUserId || null,
+      libraryId: stateEntry.libraryId || null,
+      libraryPath: stateEntry.libraryPath || null,
+      directoryPresent: directoryUserIds.has(nextcloudUserId),
+      photosPathMissing: missingPhotosIds.has(nextcloudUserId),
+      immichUserMissing: !immichUser && Boolean(stateEntry.immichUserId),
+      libraryMissing: !library && Boolean(stateEntry.libraryId),
+    });
+  }
+
+  const expectedEmails = new Set(
+    Array.from(managedUserIds)
+      .map((nextcloudUserId) => credentials[nextcloudUserId]?.email || managedState.users?.[nextcloudUserId]?.email)
+      .filter(Boolean),
+  );
+
   for (const user of users) {
-    if (!expectedUsers.has(user.email) && !user.isAdmin) {
+    if (!expectedEmails.has(user.email) && !user.isAdmin) {
       report.mismatches.push({
-        type: 'orphan-immich-user',
+        type: 'orphan_immich_user',
         immichUserId: user.id,
         immichEmail: user.email,
       });
@@ -232,9 +402,50 @@ async function runSync(report) {
   }
 }
 
+function registerManagedMismatch(report, stateEntry, details) {
+  const mismatchChanged = stateEntry.lastMismatchType !== details.mismatchType;
+  stateEntry.consecutiveMissingCycles = mismatchChanged ? 1 : stateEntry.consecutiveMissingCycles + 1;
+  stateEntry.lastMismatchAt = details.now;
+  stateEntry.lastMismatchType = details.mismatchType;
+  stateEntry.status = 'mismatch';
+
+  report.mismatches.push({
+    type: details.mismatchType,
+    nextcloudUserId: details.nextcloudUserId,
+    immichEmail: details.immichEmail,
+    immichUserId: details.immichUserId,
+    libraryId: details.libraryId,
+    libraryPath: details.libraryPath,
+    consecutiveMissingCycles: stateEntry.consecutiveMissingCycles,
+    directoryPresent: details.directoryPresent,
+    photosPathMissing: details.photosPathMissing,
+    immichUserMissing: details.immichUserMissing,
+    libraryMissing: details.libraryMissing,
+  });
+
+  if (stateEntry.consecutiveMissingCycles >= config.disableCandidateThreshold) {
+    stateEntry.status = 'disabled_candidate';
+    stateEntry.scanPolicy = 'disabled';
+    stateEntry.disabledCandidateSince = stateEntry.disabledCandidateSince || details.now;
+    report.disabledCandidates.push({
+      type: 'disabled_candidate',
+      nextcloudUserId: details.nextcloudUserId,
+      mismatchType: details.mismatchType,
+      immichEmail: details.immichEmail,
+      libraryId: details.libraryId,
+      libraryPath: details.libraryPath,
+      consecutiveMissingCycles: stateEntry.consecutiveMissingCycles,
+      scanPolicy: stateEntry.scanPolicy,
+    });
+  }
+
+  report.lifecycle.push(buildLifecycleRecord(details.nextcloudUserId, stateEntry, details.mismatchType));
+}
+
 function discoverUsers(report) {
   const entries = fs.readdirSync(config.sourceRoot, { withFileTypes: true });
-  const discovered = [];
+  const directoryUserIds = [];
+  const eligibleUsers = [];
 
   for (const entry of entries) {
     if (!entry.isDirectory()) {
@@ -248,6 +459,12 @@ function discoverUsers(report) {
       });
       continue;
     }
+
+    directoryUserIds.push(entry.name);
+    report.nextcloudDirectories.push({
+      nextcloudUserId: entry.name,
+      status: 'directory-discovered',
+    });
 
     const hostPhotosPath = path.join(config.sourceRoot, entry.name, 'files', 'Photos');
     if (!fs.existsSync(hostPhotosPath) || !fs.statSync(hostPhotosPath).isDirectory()) {
@@ -266,14 +483,159 @@ function discoverUsers(report) {
       libraryPath: path.posix.join(config.libraryRoot, entry.name, 'files', 'Photos'),
       status: 'eligible',
     };
-    discovered.push(mappedUser);
+    eligibleUsers.push(mappedUser);
     report.eligibleUsers.push(mappedUser);
   }
 
+  report.summary.nextcloudDirectories = directoryUserIds.length;
   report.summary.eligible = report.eligibleUsers.length;
   report.summary.appdataSkipped = report.appdataSkipped.length;
   report.summary.missingPhotos = report.missingPhotos.length;
-  return discovered.sort((left, right) => left.nextcloudUserId.localeCompare(right.nextcloudUserId));
+
+  return {
+    eligibleUsers: eligibleUsers.sort((left, right) => left.nextcloudUserId.localeCompare(right.nextcloudUserId)),
+    directoryUserIds: directoryUserIds.sort((left, right) => left.localeCompare(right)),
+  };
+}
+
+async function runDeprovision(args) {
+  const options = parseDeprovisionArgs(args);
+  const credentials = normalizeCredentials(loadJson(credentialsPath, {}));
+  const managedState = normalizeManagedState(loadJson(managedStatePath, { users: {} }));
+  const stateEntry = ensureManagedStateEntry(managedState, options.user);
+  const credentialEntry = credentials[options.user] || null;
+  const now = new Date().toISOString();
+  const beforeState = JSON.parse(JSON.stringify(stateEntry));
+  const beforeCredentials = credentialEntry ? JSON.parse(JSON.stringify(credentialEntry)) : null;
+
+  const result = {
+    startedAt: now,
+    finishedAt: null,
+    mode: 'deprovision',
+    apply: options.apply,
+    nextcloudUserId: options.user,
+    foundInCredentials: Boolean(credentialEntry),
+    before: {
+      state: beforeState,
+      credentials: beforeCredentials,
+    },
+    actions: options.apply
+      ? [
+          'mark-state-as-deprovisioned',
+          'disable-future-bridge-rescans-for-user',
+          'keep-existing-immich-user-and-library-intact',
+        ]
+      : [
+          'preview-only',
+          'no-remote-changes',
+          'no-local-state-written',
+        ],
+    warnings: [
+      'This command does not delete Immich assets.',
+      'This command does not delete Nextcloud files.',
+      'This command does not delete Immich users or libraries.',
+    ],
+  };
+
+  if (options.apply) {
+    stateEntry.status = 'deprovisioned';
+    stateEntry.scanPolicy = 'disabled';
+    stateEntry.deprovisionedAt = now;
+    stateEntry.lastMismatchAt = now;
+    stateEntry.lastMismatchType = 'manual_deprovision';
+    fs.writeFileSync(managedStatePath, JSON.stringify(managedState, null, 2));
+  }
+
+  result.finishedAt = new Date().toISOString();
+  result.after = options.apply ? managedState.users[options.user] : stateEntry;
+  fs.writeFileSync(deprovisionReportPath, JSON.stringify(result, null, 2));
+  log(
+    `${options.apply ? 'applied' : 'previewed'} deprovision for ${options.user}; audit written to ${deprovisionReportPath}`,
+  );
+}
+
+function buildLifecycleRecord(nextcloudUserId, stateEntry, status) {
+  return {
+    nextcloudUserId,
+    status,
+    immichEmail: stateEntry.email || null,
+    immichUserId: stateEntry.immichUserId || null,
+    libraryId: stateEntry.libraryId || null,
+    libraryPath: stateEntry.libraryPath || null,
+    scanPolicy: stateEntry.scanPolicy || 'enabled',
+    consecutiveMissingCycles: stateEntry.consecutiveMissingCycles || 0,
+    disabledCandidateSince: stateEntry.disabledCandidateSince || null,
+    deprovisionedAt: stateEntry.deprovisionedAt || null,
+  };
+}
+
+function ensureManagedStateEntry(managedState, nextcloudUserId) {
+  if (!managedState.users[nextcloudUserId]) {
+    managedState.users[nextcloudUserId] = {
+      email: null,
+      immichUserId: null,
+      libraryId: null,
+      libraryPath: null,
+      libraryName: null,
+      status: 'new',
+      scanPolicy: 'enabled',
+      consecutiveMissingCycles: 0,
+      disabledCandidateSince: null,
+      deprovisionedAt: null,
+      lastSeenAt: null,
+      lastSyncedAt: null,
+      lastHealthyAt: null,
+      lastMismatchAt: null,
+      lastMismatchType: null,
+    };
+  }
+
+  return managedState.users[nextcloudUserId];
+}
+
+function normalizeManagedState(value) {
+  const users = value && typeof value === 'object' && value.users && typeof value.users === 'object' ? value.users : {};
+  return { users };
+}
+
+function normalizeCredentials(value) {
+  return value && typeof value === 'object' ? value : {};
+}
+
+function countManagedUsers(credentials, managedState) {
+  return new Set([...Object.keys(credentials), ...Object.keys(managedState.users || {})]).size;
+}
+
+function parseCommand(argv) {
+  if (argv[0] === 'sync-once' || argv[0] === 'sync-loop' || argv[0] === 'deprovision') {
+    return { command: argv[0], args: argv.slice(1) };
+  }
+
+  return { command: null, args: argv };
+}
+
+function parseDeprovisionArgs(args) {
+  let user = null;
+  let apply = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--user') {
+      user = args[index + 1] || null;
+      index += 1;
+      continue;
+    }
+
+    if (arg === '--apply') {
+      apply = true;
+    }
+  }
+
+  if (!user) {
+    throw new Error('deprovision requires --user <nextcloud-user-id>');
+  }
+
+  return { user, apply };
 }
 
 function toImmichEmail(nextcloudUserId) {

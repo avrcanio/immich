@@ -408,6 +408,7 @@ function registerManagedMismatch(report, stateEntry, details) {
   stateEntry.lastMismatchAt = details.now;
   stateEntry.lastMismatchType = details.mismatchType;
   stateEntry.status = 'mismatch';
+  let lifecycleStatus = details.mismatchType;
 
   report.mismatches.push({
     type: details.mismatchType,
@@ -427,6 +428,7 @@ function registerManagedMismatch(report, stateEntry, details) {
     stateEntry.status = 'disabled_candidate';
     stateEntry.scanPolicy = 'disabled';
     stateEntry.disabledCandidateSince = stateEntry.disabledCandidateSince || details.now;
+    lifecycleStatus = 'disabled_candidate';
     report.disabledCandidates.push({
       type: 'disabled_candidate',
       nextcloudUserId: details.nextcloudUserId,
@@ -439,7 +441,7 @@ function registerManagedMismatch(report, stateEntry, details) {
     });
   }
 
-  report.lifecycle.push(buildLifecycleRecord(details.nextcloudUserId, stateEntry, details.mismatchType));
+  report.lifecycle.push(buildLifecycleRecord(details.nextcloudUserId, stateEntry, lifecycleStatus));
 }
 
 function discoverUsers(report) {

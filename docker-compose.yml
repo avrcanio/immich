@@ -49,6 +49,30 @@ services:
       - immich-server
     restart: unless-stopped
 
+  media-operations:
+    build:
+      context: ./media-operations
+    container_name: immich_media_operations
+    env_file:
+      - .env
+    environment:
+      IMMICH_API_URL: ${IMMICH_API_URL:-http://immich-server:2283/api}
+      MEDIA_OPS_SOURCE_ROOT: ${MEDIA_OPS_SOURCE_ROOT:-/external-libraries/nextcloud-data}
+      MEDIA_OPS_STATE_DIR: /state
+      MEDIA_OPS_BRIDGE_STATE_DIR: /bridge-state
+      MEDIA_OPS_PORT: ${MEDIA_OPS_PORT:-8091}
+      MEDIA_OPS_DRY_RUN: ${MEDIA_OPS_DRY_RUN:-true}
+      MEDIA_OPS_WRITEBACK_ENABLED: ${MEDIA_OPS_WRITEBACK_ENABLED:-false}
+      MEDIA_OPS_DELETE_ENABLED: ${MEDIA_OPS_DELETE_ENABLED:-false}
+      MEDIA_OPS_FOLDER_MOVE_ENABLED: ${MEDIA_OPS_FOLDER_MOVE_ENABLED:-false}
+    volumes:
+      - /opt/stacks/nextcloud/docker-data/nextcloud/data:/external-libraries/nextcloud-data:ro
+      - ./docker-data/bridge:/bridge-state:ro
+      - ./docker-data/media-operations:/state
+    depends_on:
+      - immich-server
+    restart: unless-stopped
+
   immich-machine-learning:
     container_name: immich_machine_learning
     image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-v2}

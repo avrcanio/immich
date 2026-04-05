@@ -18,6 +18,13 @@ const config = {
   folderMoveEnabled: parseBoolean(env('MEDIA_OPS_FOLDER_MOVE_ENABLED', 'false')),
   nextcloudAlbumWritebackEnabled: parseBoolean(env('MEDIA_OPS_NEXTCLOUD_ALBUM_WRITEBACK_ENABLED', 'false')),
   nextcloudContainerName: env('MEDIA_OPS_NEXTCLOUD_CONTAINER_NAME', 'nextcloud'),
+  internalEventSecret: env('MEDIA_OPS_INTERNAL_EVENT_SECRET', ''),
+  nextcloudTrashSyncEnabled: parseBoolean(env('MEDIA_OPS_NEXTCLOUD_TRASH_SYNC_ENABLED', 'false')),
+  nextcloudTrashRestoreEnabled: parseBoolean(env('MEDIA_OPS_NEXTCLOUD_TRASH_RESTORE_ENABLED', 'false')),
+  dbHostname: env('DB_HOSTNAME', 'postgis'),
+  dbUsername: env('DB_USERNAME', 'immich'),
+  dbPassword: env('DB_PASSWORD', ''),
+  dbDatabaseName: env('DB_DATABASE_NAME', 'immich'),
 };
 
 const managedStatePath = path.join(config.bridgeStateDir, 'managed-state.json');
@@ -25,6 +32,7 @@ const credentialsPath = path.join(config.bridgeStateDir, 'credentials.json');
 const operationsStatePath = path.join(config.stateDir, 'operations-state.json');
 const lastOperationPath = path.join(config.stateDir, 'last-operation.json');
 const auditLogPath = path.join(config.stateDir, 'audit.log');
+const trashSyncStatePath = path.join(config.stateDir, 'trash-sync-state.json');
 
 fs.mkdirSync(config.stateDir, { recursive: true });
 
@@ -63,6 +71,9 @@ async function serve() {
           folderMoveEnabled: config.folderMoveEnabled,
           nextcloudAlbumWritebackEnabled: config.nextcloudAlbumWritebackEnabled,
           nextcloudContainerName: config.nextcloudContainerName,
+          nextcloudTrashSyncEnabled: config.nextcloudTrashSyncEnabled,
+          nextcloudTrashRestoreEnabled: config.nextcloudTrashRestoreEnabled,
+          immichEventWebhookEnabled: Boolean(config.internalEventSecret),
         });
       }
 
@@ -73,6 +84,13 @@ async function serve() {
       if (request.method === 'POST' && request.url === '/operations') {
         const payload = await readJsonBody(request);
         const result = await dispatchOperation(payload);
+        return respondJson(response, 200, result);
+      }
+
+      if (request.method === 'POST' && request.url === '/internal/immich-events') {
+        verifyInternalEventRequest(request);
+        const payload = await readJsonBody(request);
+        const result = await handleInternalImmichEvent(payload);
         return respondJson(response, 200, result);
       }
 
@@ -97,6 +115,9 @@ function getCapabilities() {
     folderMoveEnabled: config.folderMoveEnabled,
     nextcloudAlbumWritebackEnabled: config.nextcloudAlbumWritebackEnabled,
     nextcloudContainerName: config.nextcloudContainerName,
+    nextcloudTrashSyncEnabled: config.nextcloudTrashSyncEnabled,
+    nextcloudTrashRestoreEnabled: config.nextcloudTrashRestoreEnabled,
+    immichEventWebhookEnabled: Boolean(config.internalEventSecret),
     supported: [
       'create-album',
       'update-album',
@@ -107,12 +128,41 @@ function getCapabilities() {
       'trash-assets',
       'confirm-delete-assets',
       'move-assets-to-folder',
+      'immich-trash-webhook',
     ],
     destructiveOperationsRequireApply: [
       'confirm-delete-assets',
       'move-assets-to-folder',
     ],
     writebackMode: config.writebackEnabled ? 'opt-in-live' : 'audit-only',
+  };
+}
+
+async function handleInternalImmichEvent(payload) {
+  const eventType = requiredString(payload.eventType, 'eventType');
+  const userId = requiredString(payload.userId, 'userId');
+  const assetIds = requiredStringArray(payload.assetIds, 'assetIds');
+  const eventRecord = {
+    id: optionalString(payload.correlationId) || crypto.randomUUID(),
+    eventType,
+    userId,
+    assetIds,
+    receivedAt: new Date().toISOString(),
+    sourceTimestamp: optionalString(payload.timestamp) || null,
+  };
+
+  writeAuditEntry({
+    kind: 'immich-trash-event-received',
+    ...eventRecord,
+  });
+
+  const result = await processImmichEvent(eventRecord);
+  return {
+    accepted: true,
+    eventId: eventRecord.id,
+    eventType,
+    assetCount: assetIds.length,
+    result,
   };
 }
 
@@ -481,7 +531,40 @@ async function createUserContext(nextcloudUserId) {
     immichUserId: stateEntry.immichUserId,
     libraryPath: preferredLibrary.libraryPath,
     libraryName: preferredLibrary.libraryName || null,
+    stateEntry,
     accessToken,
+  };
+}
+
+async function createUserContextByImmichUserId(immichUserId) {
+  const managedState = loadJson(managedStatePath, { users: {} });
+  const users = managedState.users && typeof managedState.users === 'object' ? managedState.users : {};
+  const nextcloudUserId = Object.keys(users).find((candidate) => users[candidate]?.immichUserId === immichUserId);
+
+  if (!nextcloudUserId) {
+    throw new Error(`Unknown managed Immich user: ${immichUserId}`);
+  }
+
+  return createManagedContext(nextcloudUserId, users[nextcloudUserId]);
+}
+
+function createManagedContext(nextcloudUserId, stateEntry) {
+  if (!stateEntry) {
+    throw new Error(`Unknown managed user: ${nextcloudUserId}`);
+  }
+
+  const preferredLibrary = resolvePreferredLibraryState(stateEntry);
+  if (!preferredLibrary?.libraryPath || !stateEntry.immichUserId || !stateEntry.email) {
+    throw new Error(`Managed user is missing bridge identity data: ${nextcloudUserId}`);
+  }
+
+  return {
+    nextcloudUserId,
+    immichEmail: stateEntry.email,
+    immichUserId: stateEntry.immichUserId,
+    libraryPath: preferredLibrary.libraryPath,
+    libraryName: preferredLibrary.libraryName || null,
+    stateEntry,
   };
 }
 
@@ -526,6 +609,211 @@ async function validateAssetsOwned(context, assetIds) {
   return {
     assetCount: assets.length,
     assets,
+  };
+}
+
+async function processImmichEvent(eventRecord) {
+  const isTrashEvent = eventRecord.eventType === 'AssetTrashAll';
+  const isRestoreEvent = eventRecord.eventType === 'AssetRestoreAll';
+
+  if (!isTrashEvent && !isRestoreEvent) {
+    const result = {
+      eventId: eventRecord.id,
+      status: 'ignored',
+      reason: `Unsupported event type: ${eventRecord.eventType}`,
+      assets: [],
+    };
+    writeAuditEntry({
+      kind: 'nextcloud-trash-skipped',
+      eventId: eventRecord.id,
+      eventType: eventRecord.eventType,
+      reason: result.reason,
+    });
+    return result;
+  }
+
+  if (isTrashEvent && !config.nextcloudTrashSyncEnabled) {
+    return {
+      eventId: eventRecord.id,
+      status: 'disabled',
+      reason: 'MEDIA_OPS_NEXTCLOUD_TRASH_SYNC_ENABLED=false',
+      assets: [],
+    };
+  }
+
+  if (isRestoreEvent && !config.nextcloudTrashRestoreEnabled) {
+    return {
+      eventId: eventRecord.id,
+      status: 'disabled',
+      reason: 'MEDIA_OPS_NEXTCLOUD_TRASH_RESTORE_ENABLED=false',
+      assets: [],
+    };
+  }
+
+  const context = await createUserContextByImmichUserId(eventRecord.userId);
+  const state = loadTrashSyncState();
+  const results = [];
+
+  for (const assetId of eventRecord.assetIds) {
+    const assetResult = isTrashEvent
+      ? await applyNextcloudTrashEvent(context, state, eventRecord, assetId)
+      : await applyNextcloudRestoreEvent(context, state, eventRecord, assetId);
+    results.push(assetResult);
+  }
+
+  saveTrashSyncState(state);
+
+  return {
+    eventId: eventRecord.id,
+    status: results.some((item) => item.status === 'error') ? 'partial_failure' : 'success',
+    nextcloudUserId: context.nextcloudUserId,
+    assets: results,
+  };
+}
+
+async function applyNextcloudTrashEvent(context, state, eventRecord, assetId) {
+  const asset = await lookupAssetForEvent(assetId);
+  const originalPath = asset.originalPath || null;
+  const ownerId = asset.ownerId || null;
+  const library = resolveManagedLibraryForPath(context.stateEntry, originalPath);
+  const relativePath = buildManagedNextcloudRelativePath(context.nextcloudUserId, originalPath);
+
+  if (!originalPath || !library || !relativePath || ownerId !== context.immichUserId) {
+    const skipped = {
+      assetId,
+      status: 'skipped_unmanaged',
+      originalPath: originalPath || null,
+      relativePath: relativePath || null,
+    };
+    recordTrashSyncEntry(state, {
+      eventId: eventRecord.id,
+      eventType: eventRecord.eventType,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      originalPath: originalPath || null,
+      relativePath: relativePath || null,
+      librarySourceKey: library?.sourceKey || null,
+      status: skipped.status,
+      lastError: null,
+    });
+    writeAuditEntry({
+      kind: 'nextcloud-trash-skipped',
+      eventId: eventRecord.id,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      reason: 'unmanaged_or_unmappable_path',
+      originalPath: originalPath || null,
+    });
+    return skipped;
+  }
+
+  const deleteResult = runNextcloudFileTrashDelete(context.nextcloudUserId, relativePath);
+  const status = deleteResult.status === 'trashed' ? 'trashed' : deleteResult.status === 'missing_source' ? 'already_trashed_or_missing' : deleteResult.status;
+
+  recordTrashSyncEntry(state, {
+    eventId: eventRecord.id,
+    eventType: eventRecord.eventType,
+    assetId,
+    nextcloudUserId: context.nextcloudUserId,
+    originalPath,
+    relativePath,
+    librarySourceKey: library.sourceKey,
+    status,
+    appliedAt: status === 'trashed' ? new Date().toISOString() : undefined,
+    restoredAt: null,
+    lastError: deleteResult.status === 'error' ? deleteResult.message : null,
+  });
+
+  writeAuditEntry({
+    kind: deleteResult.status === 'error' ? 'nextcloud-trash-error' : 'nextcloud-trash-applied',
+    eventId: eventRecord.id,
+    assetId,
+    nextcloudUserId: context.nextcloudUserId,
+    originalPath,
+    relativePath,
+    status,
+    message: deleteResult.message,
+  });
+
+  return {
+    assetId,
+    librarySourceKey: library.sourceKey,
+    originalPath,
+    relativePath,
+    status,
+    message: deleteResult.message,
+  };
+}
+
+async function applyNextcloudRestoreEvent(context, state, eventRecord, assetId) {
+  const asset = await lookupAssetForEvent(assetId);
+  const originalPath = asset.originalPath || null;
+  const ownerId = asset.ownerId || null;
+  const library = resolveManagedLibraryForPath(context.stateEntry, originalPath);
+  const relativePath = buildManagedNextcloudRelativePath(context.nextcloudUserId, originalPath);
+
+  if (!originalPath || !library || !relativePath || ownerId !== context.immichUserId) {
+    const skipped = {
+      assetId,
+      status: 'skipped_unmanaged',
+      originalPath: originalPath || null,
+      relativePath: relativePath || null,
+    };
+    recordTrashSyncEntry(state, {
+      eventId: eventRecord.id,
+      eventType: eventRecord.eventType,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      originalPath: originalPath || null,
+      relativePath: relativePath || null,
+      librarySourceKey: library?.sourceKey || null,
+      status: skipped.status,
+      lastError: null,
+    });
+    writeAuditEntry({
+      kind: 'nextcloud-restore-skipped',
+      eventId: eventRecord.id,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      reason: 'unmanaged_or_unmappable_path',
+      originalPath: originalPath || null,
+    });
+    return skipped;
+  }
+
+  const restoreResult = runNextcloudFileTrashRestore(context.nextcloudUserId, relativePath);
+
+  recordTrashSyncEntry(state, {
+    eventId: eventRecord.id,
+    eventType: eventRecord.eventType,
+    assetId,
+    nextcloudUserId: context.nextcloudUserId,
+    originalPath,
+    relativePath,
+    librarySourceKey: library.sourceKey,
+    status: restoreResult.status,
+    restoredAt: restoreResult.status === 'restored' || restoreResult.status === 'already_restored' ? new Date().toISOString() : undefined,
+    lastError: restoreResult.status === 'error' ? restoreResult.message : null,
+  });
+
+  writeAuditEntry({
+    kind: restoreResult.status === 'error' ? 'nextcloud-restore-error' : 'nextcloud-restore-applied',
+    eventId: eventRecord.id,
+    assetId,
+    nextcloudUserId: context.nextcloudUserId,
+    originalPath,
+    relativePath,
+    status: restoreResult.status,
+    message: restoreResult.message,
+  });
+
+  return {
+    assetId,
+    librarySourceKey: library.sourceKey,
+    originalPath,
+    relativePath,
+    status: restoreResult.status,
+    message: restoreResult.message,
   };
 }
 
@@ -624,6 +912,43 @@ function buildNextcloudRelativeAssetPath(context, originalPath) {
   return relativePath;
 }
 
+function buildManagedNextcloudRelativePath(nextcloudUserId, originalPath) {
+  if (!originalPath) {
+    return null;
+  }
+
+  const filesRoot = `${path.posix.join(config.sourceRoot, nextcloudUserId, 'files')}/`;
+  if (!originalPath.startsWith(filesRoot)) {
+    return null;
+  }
+
+  const relativePath = originalPath.slice(filesRoot.length);
+  if (!relativePath || relativePath.startsWith('/') || relativePath.includes('/../') || relativePath === '..') {
+    return null;
+  }
+
+  return relativePath;
+}
+
+function resolveManagedLibraryForPath(stateEntry, originalPath) {
+  if (!stateEntry || !originalPath) {
+    return null;
+  }
+
+  const libraries = stateEntry.libraries && typeof stateEntry.libraries === 'object' ? stateEntry.libraries : {};
+  for (const library of Object.values(libraries)) {
+    if (!library?.libraryPath) {
+      continue;
+    }
+
+    if (originalPath === library.libraryPath || originalPath.startsWith(`${library.libraryPath}/`)) {
+      return library;
+    }
+  }
+
+  return null;
+}
+
 function runNextcloudAlbumCreate(nextcloudUserId, albumName) {
   const command = ['exec', '-u', 'www-data', config.nextcloudContainerName, 'php', 'occ', 'photos:albums:create', nextcloudUserId, albumName];
   return runNextcloudOcc(command, {
@@ -639,6 +964,86 @@ function runNextcloudAlbumAdd(nextcloudUserId, albumName, relativePath) {
     successStatus: 'added',
     idempotentPatterns: [/already.*album/i, /already in album/i, /unique violation/i, /duplicate key value/i, /paf_album_file/i],
     idempotentStatus: 'already_present',
+  });
+}
+
+function runNextcloudFileTrashDelete(nextcloudUserId, relativePath) {
+  return runNextcloudPhpJson(`
+require '/var/www/html/lib/base.php';
+$userId = $argv[1] ?? '';
+$relativePath = ltrim($argv[2] ?? '', '/');
+if ($userId === '' || $relativePath === '') {
+  echo json_encode(['status' => 'error', 'message' => 'Missing user or path']);
+  exit(1);
+}
+try {
+  $userFolder = \\OC::$server->getUserFolder($userId);
+  if (!$userFolder->nodeExists($relativePath)) {
+    echo json_encode(['status' => 'missing_source', 'message' => 'File is already missing from active storage']);
+    exit(0);
+  }
+  $node = $userFolder->get($relativePath);
+  if (!$node->isDeletable()) {
+    echo json_encode(['status' => 'error', 'message' => 'File cannot be deleted, insufficient permissions']);
+    exit(0);
+  }
+  $node->delete();
+  echo json_encode(['status' => 'trashed', 'message' => 'Moved to Nextcloud trash']);
+} catch (\\Throwable $error) {
+  echo json_encode(['status' => 'error', 'message' => $error->getMessage()]);
+  exit(1);
+}
+`, [nextcloudUserId, relativePath], {
+    successStatus: 'trashed',
+  });
+}
+
+function runNextcloudFileTrashRestore(nextcloudUserId, relativePath) {
+  return runNextcloudPhpJson(`
+require '/var/www/html/lib/base.php';
+$userId = $argv[1] ?? '';
+$relativePath = ltrim($argv[2] ?? '', '/');
+if ($userId === '' || $relativePath === '') {
+  echo json_encode(['status' => 'error', 'message' => 'Missing user or path']);
+  exit(1);
+}
+try {
+  \\OC_Util::tearDownFS();
+  \\OC_Util::setupFS($userId);
+  \\OC_User::setUserId($userId);
+  $userFolder = \\OC::$server->getUserFolder($userId);
+  if ($userFolder->nodeExists($relativePath)) {
+    echo json_encode(['status' => 'already_restored', 'message' => 'File already exists at active path']);
+    exit(0);
+  }
+  $userManager = \\OC::$server->get(\\OCP\\IUserManager::class);
+  $trashManager = \\OC::$server->get(\\OCA\\Files_Trashbin\\Trash\\ITrashManager::class);
+  $user = $userManager->get($userId);
+  if (!$user) {
+    echo json_encode(['status' => 'error', 'message' => 'Unknown Nextcloud user']);
+    exit(1);
+  }
+  $match = null;
+  foreach ($trashManager->listTrashRoot($user) as $item) {
+    if (ltrim($item->getOriginalLocation(), '/') !== $relativePath) {
+      continue;
+    }
+    if ($match === null || $item->getDeletedTime() > $match->getDeletedTime()) {
+      $match = $item;
+    }
+  }
+  if ($match === null) {
+    echo json_encode(['status' => 'not_found', 'message' => 'Matching trash item not found']);
+    exit(0);
+  }
+  $trashManager->restoreItem($match);
+  echo json_encode(['status' => 'restored', 'message' => 'Restored from Nextcloud trash']);
+} catch (\\Throwable $error) {
+  echo json_encode(['status' => 'error', 'message' => $error->getMessage()]);
+  exit(1);
+}
+`, [nextcloudUserId, relativePath], {
+    successStatus: 'restored',
   });
 }
 
@@ -672,6 +1077,82 @@ function runNextcloudOcc(command, options) {
   }
 }
 
+function runNextcloudPhpJson(script, args, options = {}) {
+  try {
+    const stdout = execFileSync('docker', [
+      'exec',
+      '-i',
+      '-u',
+      'www-data',
+      config.nextcloudContainerName,
+      'php',
+      '-d',
+      'display_errors=stderr',
+      '-r',
+      script,
+      '--',
+      ...args,
+    ], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    return parseNextcloudPhpJson(stdout, options.successStatus || 'success');
+  } catch (error) {
+    const stdout = `${error.stdout || ''}\n${error.stderr || ''}`;
+    return parseNextcloudPhpJson(stdout, 'error', error.message);
+  }
+}
+
+function parseNextcloudPhpJson(output, fallbackStatus, fallbackMessage = null) {
+  const sanitized = sanitizeOccOutput(output);
+  const lines = sanitized ? sanitized.split('\n') : [];
+  const rawJson = [...lines].reverse().find((line) => line.startsWith('{') && line.endsWith('}'));
+  if (rawJson) {
+    const parsed = safeJsonParse(rawJson);
+    if (parsed && typeof parsed === 'object') {
+      return {
+        status: parsed.status || fallbackStatus,
+        message: parsed.message || fallbackMessage || parsed.status || fallbackStatus,
+      };
+    }
+  }
+
+  return {
+    status: fallbackStatus,
+    message: fallbackMessage || sanitized || fallbackStatus,
+  };
+}
+
+function runPostgresQuery(sql) {
+  if (!config.dbPassword) {
+    throw new Error('DB_PASSWORD is required for event asset lookup');
+  }
+
+  try {
+    const stdout = execFileSync('docker', [
+      'exec',
+      '-e',
+      `PGPASSWORD=${config.dbPassword}`,
+      config.dbHostname,
+      'psql',
+      '-U',
+      config.dbUsername,
+      '-d',
+      config.dbDatabaseName,
+      '-Atc',
+      sql,
+    ], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return stdout.trim() || null;
+  } catch (error) {
+    const output = sanitizeOccOutput(`${error.stdout || ''}\n${error.stderr || ''}`);
+    throw new Error(`Postgres lookup failed: ${output || error.message}`);
+  }
+}
+
 function sanitizeOccOutput(rawOutput) {
   return String(rawOutput || '')
     .split('\n')
@@ -700,7 +1181,7 @@ function resolveAlbumName(album, albumId) {
 
 function persistOperation(result) {
   fs.writeFileSync(lastOperationPath, JSON.stringify(result, null, 2));
-  fs.appendFileSync(auditLogPath, `${JSON.stringify(result)}\n`);
+  writeAuditEntry(result);
 }
 
 function loadOperationsState() {
@@ -713,6 +1194,27 @@ function loadOperationsState() {
 
 function saveOperationsState(state) {
   fs.writeFileSync(operationsStatePath, JSON.stringify(state, null, 2));
+}
+
+function loadTrashSyncState() {
+  const state = loadJson(trashSyncStatePath, {
+    assets: {},
+  });
+  state.assets = state.assets && typeof state.assets === 'object' ? state.assets : {};
+  return state;
+}
+
+function saveTrashSyncState(state) {
+  fs.writeFileSync(trashSyncStatePath, JSON.stringify(state, null, 2));
+}
+
+function recordTrashSyncEntry(state, entry) {
+  const existing = state.assets[entry.assetId] || {};
+  state.assets[entry.assetId] = {
+    ...existing,
+    ...entry,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 function finalizeResult(operation, payload, context, details) {
@@ -770,6 +1272,64 @@ async function immichRequest(accessToken, method, pathname, body) {
   return data;
 }
 
+async function immichAdminRequest(method, pathname, body) {
+  if (!config.immichAdminApiKey) {
+    throw new Error('IMMICH_API_KEY is required for admin event processing');
+  }
+
+  const response = await fetch(`${config.immichApiUrl}${pathname}`, {
+    method,
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'x-api-key': config.immichAdminApiKey,
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+
+  const text = await response.text();
+  const data = text ? safeJsonParse(text) : null;
+  if (!response.ok) {
+    throw new Error(`${method} ${pathname} failed with ${response.status}: ${text}`);
+  }
+  return data;
+}
+
+async function lookupAssetForEvent(assetId) {
+  try {
+    const asset = await immichAdminRequest('GET', `/assets/${assetId}`);
+    return {
+      id: asset.id,
+      ownerId: asset.ownerId || asset.owner?.id || null,
+      originalPath: extractOriginalPath(asset),
+      isTrashed: Boolean(asset.isTrashed),
+    };
+  } catch (error) {
+    if (!String(error.message || error).includes('403')) {
+      throw error;
+    }
+  }
+
+  return lookupAssetForEventFromDatabase(assetId);
+}
+
+function lookupAssetForEventFromDatabase(assetId) {
+  const sql = `select id, "ownerId", "originalPath", ("deletedAt" is not null) as "isTrashed" from asset where id = '${String(assetId).replace(/'/g, "''")}' limit 1;`;
+  const row = runPostgresQuery(sql);
+
+  if (!row) {
+    throw new Error(`Asset ${assetId} not found in database`);
+  }
+
+  const [id, ownerId, originalPath, isTrashed] = row.split('|');
+  return {
+    id,
+    ownerId: ownerId || null,
+    originalPath: originalPath || null,
+    isTrashed: isTrashed === 't',
+  };
+}
+
 function extractOriginalPath(asset) {
   return (
     asset.originalPath ||
@@ -796,10 +1356,25 @@ function readJsonBody(request) {
   });
 }
 
+function verifyInternalEventRequest(request) {
+  if (!config.internalEventSecret) {
+    throw new Error('MEDIA_OPS_INTERNAL_EVENT_SECRET is not configured');
+  }
+
+  const providedSecret = request.headers['x-immich-event-secret'];
+  if (providedSecret !== config.internalEventSecret) {
+    throw new Error('Unauthorized internal event request');
+  }
+}
+
 function respondJson(response, statusCode, body) {
   response.statusCode = statusCode;
   response.setHeader('Content-Type', 'application/json');
   response.end(JSON.stringify(body));
+}
+
+function writeAuditEntry(entry) {
+  fs.appendFileSync(auditLogPath, `${JSON.stringify(entry)}\n`);
 }
 
 function parseCommand(argv) {

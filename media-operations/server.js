@@ -33,6 +33,8 @@ const operationsStatePath = path.join(config.stateDir, 'operations-state.json');
 const lastOperationPath = path.join(config.stateDir, 'last-operation.json');
 const auditLogPath = path.join(config.stateDir, 'audit.log');
 const trashSyncStatePath = path.join(config.stateDir, 'trash-sync-state.json');
+const deleteLookupIndexPath = path.join(config.stateDir, 'delete-lookup-index.json');
+const deleteLookupTtlMs = 30 * 24 * 60 * 60 * 1000;
 
 fs.mkdirSync(config.stateDir, { recursive: true });
 
@@ -512,8 +514,8 @@ async function handleMoveAssetsToFolder(payload) {
 async function createUserContext(nextcloudUserId) {
   const managedState = loadJson(managedStatePath, { users: {} });
   const credentials = loadJson(credentialsPath, {});
-  const stateEntry = managedState.users?.[nextcloudUserId];
-  const credentialEntry = credentials[nextcloudUserId];
+  const [managedEmail, stateEntry] = findManagedUserByNextcloudUserId(managedState, nextcloudUserId);
+  const credentialEntry = managedEmail ? credentials[managedEmail] : null;
 
   if (!stateEntry || !credentialEntry) {
     throw new Error(`Unknown managed user: ${nextcloudUserId}`);
@@ -539,13 +541,13 @@ async function createUserContext(nextcloudUserId) {
 async function createUserContextByImmichUserId(immichUserId) {
   const managedState = loadJson(managedStatePath, { users: {} });
   const users = managedState.users && typeof managedState.users === 'object' ? managedState.users : {};
-  const nextcloudUserId = Object.keys(users).find((candidate) => users[candidate]?.immichUserId === immichUserId);
+  const managedEmail = Object.keys(users).find((candidate) => users[candidate]?.immichUserId === immichUserId);
 
-  if (!nextcloudUserId) {
+  if (!managedEmail) {
     throw new Error(`Unknown managed Immich user: ${immichUserId}`);
   }
 
-  return createManagedContext(nextcloudUserId, users[nextcloudUserId]);
+  return createManagedContext(users[managedEmail].nextcloudUserId || managedEmail, users[managedEmail]);
 }
 
 function createManagedContext(nextcloudUserId, stateEntry) {
@@ -559,13 +561,24 @@ function createManagedContext(nextcloudUserId, stateEntry) {
   }
 
   return {
-    nextcloudUserId,
+    nextcloudUserId: stateEntry.nextcloudUserId || nextcloudUserId,
     immichEmail: stateEntry.email,
     immichUserId: stateEntry.immichUserId,
     libraryPath: preferredLibrary.libraryPath,
     libraryName: preferredLibrary.libraryName || null,
     stateEntry,
   };
+}
+
+function findManagedUserByNextcloudUserId(managedState, nextcloudUserId) {
+  const users = managedState.users && typeof managedState.users === 'object' ? managedState.users : {};
+  for (const [email, entry] of Object.entries(users)) {
+    if (entry?.nextcloudUserId === nextcloudUserId) {
+      return [email, entry];
+    }
+  }
+
+  return [null, null];
 }
 
 function resolvePreferredLibraryState(stateEntry) {
@@ -615,8 +628,9 @@ async function validateAssetsOwned(context, assetIds) {
 async function processImmichEvent(eventRecord) {
   const isTrashEvent = eventRecord.eventType === 'AssetTrashAll';
   const isRestoreEvent = eventRecord.eventType === 'AssetRestoreAll';
+  const isDeleteEvent = eventRecord.eventType === 'AssetDeleteAll';
 
-  if (!isTrashEvent && !isRestoreEvent) {
+  if (!isTrashEvent && !isRestoreEvent && !isDeleteEvent) {
     const result = {
       eventId: eventRecord.id,
       status: 'ignored',
@@ -650,18 +664,56 @@ async function processImmichEvent(eventRecord) {
     };
   }
 
+  if (isDeleteEvent && !config.nextcloudTrashSyncEnabled) {
+    return {
+      eventId: eventRecord.id,
+      status: 'disabled',
+      reason: 'MEDIA_OPS_NEXTCLOUD_TRASH_SYNC_ENABLED=false',
+      assets: [],
+    };
+  }
+
   const context = await createUserContextByImmichUserId(eventRecord.userId);
   const state = loadTrashSyncState();
+  const deleteLookupIndex = pruneDeleteLookupIndex(loadDeleteLookupIndex());
   const results = [];
 
   for (const assetId of eventRecord.assetIds) {
-    const assetResult = isTrashEvent
-      ? await applyNextcloudTrashEvent(context, state, eventRecord, assetId)
-      : await applyNextcloudRestoreEvent(context, state, eventRecord, assetId);
-    results.push(assetResult);
+    try {
+      const assetResult = isTrashEvent
+        ? await applyNextcloudTrashEvent(context, state, deleteLookupIndex, eventRecord, assetId)
+        : isRestoreEvent
+          ? await applyNextcloudRestoreEvent(context, state, deleteLookupIndex, eventRecord, assetId)
+          : await applyNextcloudDeleteEvent(context, state, deleteLookupIndex, eventRecord, assetId);
+      results.push(assetResult);
+    } catch (error) {
+      const failure = {
+        assetId,
+        status: 'error',
+        message: String(error.message || error),
+      };
+      results.push(failure);
+      writeAuditEntry({
+        kind: isDeleteEvent ? 'nextcloud-delete-error' : isRestoreEvent ? 'nextcloud-restore-error' : 'nextcloud-trash-error',
+        eventId: eventRecord.id,
+        assetId,
+        nextcloudUserId: context.nextcloudUserId,
+        status: 'error',
+        message: failure.message,
+      });
+      recordTrashSyncEntry(state, {
+        eventId: eventRecord.id,
+        eventType: eventRecord.eventType,
+        assetId,
+        nextcloudUserId: context.nextcloudUserId,
+        status: 'error',
+        lastError: failure.message,
+      });
+    }
   }
 
   saveTrashSyncState(state);
+  saveDeleteLookupIndex(deleteLookupIndex);
 
   return {
     eventId: eventRecord.id,
@@ -671,7 +723,7 @@ async function processImmichEvent(eventRecord) {
   };
 }
 
-async function applyNextcloudTrashEvent(context, state, eventRecord, assetId) {
+async function applyNextcloudTrashEvent(context, state, deleteLookupIndex, eventRecord, assetId) {
   const asset = await lookupAssetForEvent(assetId);
   const originalPath = asset.originalPath || null;
   const ownerId = asset.ownerId || null;
@@ -723,6 +775,14 @@ async function applyNextcloudTrashEvent(context, state, eventRecord, assetId) {
     restoredAt: null,
     lastError: deleteResult.status === 'error' ? deleteResult.message : null,
   });
+  refreshDeleteLookupEntry(deleteLookupIndex, {
+    assetId,
+    nextcloudUserId: context.nextcloudUserId,
+    originalPath,
+    relativePath,
+    librarySourceKey: library.sourceKey,
+    lastSeenEventType: eventRecord.eventType,
+  });
 
   writeAuditEntry({
     kind: deleteResult.status === 'error' ? 'nextcloud-trash-error' : 'nextcloud-trash-applied',
@@ -745,7 +805,7 @@ async function applyNextcloudTrashEvent(context, state, eventRecord, assetId) {
   };
 }
 
-async function applyNextcloudRestoreEvent(context, state, eventRecord, assetId) {
+async function applyNextcloudRestoreEvent(context, state, deleteLookupIndex, eventRecord, assetId) {
   const asset = await lookupAssetForEvent(assetId);
   const originalPath = asset.originalPath || null;
   const ownerId = asset.ownerId || null;
@@ -795,6 +855,14 @@ async function applyNextcloudRestoreEvent(context, state, eventRecord, assetId) 
     restoredAt: restoreResult.status === 'restored' || restoreResult.status === 'already_restored' ? new Date().toISOString() : undefined,
     lastError: restoreResult.status === 'error' ? restoreResult.message : null,
   });
+  refreshDeleteLookupEntry(deleteLookupIndex, {
+    assetId,
+    nextcloudUserId: context.nextcloudUserId,
+    originalPath,
+    relativePath,
+    librarySourceKey: library.sourceKey,
+    lastSeenEventType: eventRecord.eventType,
+  });
 
   writeAuditEntry({
     kind: restoreResult.status === 'error' ? 'nextcloud-restore-error' : 'nextcloud-restore-applied',
@@ -815,6 +883,200 @@ async function applyNextcloudRestoreEvent(context, state, eventRecord, assetId) 
     status: restoreResult.status,
     message: restoreResult.message,
   };
+}
+
+async function applyNextcloudDeleteEvent(context, state, deleteLookupIndex, eventRecord, assetId) {
+  const target = await resolveDeleteTargetForEvent(context, state, deleteLookupIndex, assetId);
+  const originalPath = target.originalPath || null;
+  const ownerId = target.ownerId || null;
+  const library = resolveManagedLibraryForPath(context.stateEntry, originalPath)
+    || (target.librarySourceKey ? { sourceKey: target.librarySourceKey } : null);
+  const relativePath = target.relativePath || buildManagedNextcloudRelativePath(context.nextcloudUserId, originalPath);
+
+  if (!originalPath || !library || !relativePath || ownerId !== context.immichUserId) {
+    const skipped = {
+      assetId,
+      status: 'skipped_unmanaged',
+      originalPath: originalPath || null,
+      relativePath: relativePath || null,
+    };
+    recordTrashSyncEntry(state, {
+      eventId: eventRecord.id,
+      eventType: eventRecord.eventType,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      originalPath: originalPath || null,
+      relativePath: relativePath || null,
+      librarySourceKey: library?.sourceKey || null,
+      status: skipped.status,
+      lastError: null,
+    });
+    writeAuditEntry({
+      kind: 'nextcloud-delete-skipped',
+      eventId: eventRecord.id,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      reason: 'unmanaged_or_unmappable_path',
+      originalPath: originalPath || null,
+    });
+    return skipped;
+  }
+
+  if (['trash-sync-state', 'delete-lookup-index', 'audit-log'].includes(target.source)) {
+    writeAuditEntry({
+      kind:
+        target.source === 'audit-log'
+          ? 'resolved_from_audit_log'
+          : target.source === 'delete-lookup-index'
+            ? 'resolved_from_delete_lookup_index'
+            : 'resolved_from_trash_sync_state',
+      eventId: eventRecord.id,
+      eventType: eventRecord.eventType,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      originalPath,
+      relativePath,
+    });
+  }
+
+  const deleteResult = runNextcloudFileTrashDeletePermanent(context.nextcloudUserId, relativePath);
+  const status =
+    deleteResult.status === 'deleted'
+      ? 'deleted_from_nextcloud_trash'
+      : deleteResult.status === 'not_found'
+        ? 'already_deleted_or_missing'
+        : deleteResult.status;
+
+  recordTrashSyncEntry(state, {
+    eventId: eventRecord.id,
+    eventType: eventRecord.eventType,
+    assetId,
+    nextcloudUserId: context.nextcloudUserId,
+    originalPath,
+    relativePath,
+    librarySourceKey: library.sourceKey,
+    status,
+    deletedAt: status === 'deleted_from_nextcloud_trash' ? new Date().toISOString() : undefined,
+    lastError: deleteResult.status === 'error' ? deleteResult.message : null,
+  });
+  refreshDeleteLookupEntry(deleteLookupIndex, {
+    assetId,
+    nextcloudUserId: context.nextcloudUserId,
+    originalPath,
+    relativePath,
+    librarySourceKey: library.sourceKey,
+    lastSeenEventType: eventRecord.eventType,
+  });
+
+  writeAuditEntry({
+    kind: deleteResult.status === 'error' ? 'nextcloud-delete-error' : 'nextcloud-delete-applied',
+    eventId: eventRecord.id,
+    assetId,
+    nextcloudUserId: context.nextcloudUserId,
+    originalPath,
+    relativePath,
+    status,
+    message: deleteResult.message,
+  });
+
+  return {
+    assetId,
+    librarySourceKey: library.sourceKey,
+    originalPath,
+    relativePath,
+    status,
+    message: deleteResult.message,
+  };
+}
+
+async function resolveDeleteTargetForEvent(context, state, deleteLookupIndex, assetId) {
+  try {
+    const asset = await lookupAssetForEvent(assetId);
+    return {
+      ownerId: asset.ownerId || null,
+      originalPath: asset.originalPath || null,
+      relativePath: buildManagedNextcloudRelativePath(context.nextcloudUserId, asset.originalPath || null),
+      librarySourceKey: resolveManagedLibraryForPath(context.stateEntry, asset.originalPath || null)?.sourceKey || null,
+      source: 'asset',
+    };
+  } catch (error) {
+    if (!String(error.message || error).includes(`Asset ${assetId} not found in database`)) {
+      throw error;
+    }
+  }
+
+  const fallback = state.assets?.[assetId];
+  if (fallback) {
+    return {
+      ownerId: context.immichUserId,
+      originalPath: fallback.originalPath || null,
+      relativePath: fallback.relativePath || buildManagedNextcloudRelativePath(context.nextcloudUserId, fallback.originalPath || null),
+      librarySourceKey: fallback.librarySourceKey || null,
+      source: 'trash-sync-state',
+    };
+  }
+
+  const deleteLookupFallback = deleteLookupIndex.assets?.[assetId];
+  if (deleteLookupFallback && deleteLookupFallback.nextcloudUserId === context.nextcloudUserId) {
+    return {
+      ownerId: context.immichUserId,
+      originalPath: deleteLookupFallback.originalPath || null,
+      relativePath: deleteLookupFallback.relativePath || buildManagedNextcloudRelativePath(context.nextcloudUserId, deleteLookupFallback.originalPath || null),
+      librarySourceKey: deleteLookupFallback.librarySourceKey || null,
+      source: 'delete-lookup-index',
+    };
+  }
+
+  const auditFallback = lookupDeleteTargetFromAuditLog(assetId, context.nextcloudUserId);
+  if (!auditFallback) {
+    throw new Error(`Asset ${assetId} not found in database, trash sync state, delete lookup index, or audit log`);
+  }
+
+  return {
+    ownerId: context.immichUserId,
+    originalPath: auditFallback.originalPath || null,
+    relativePath: auditFallback.relativePath || buildManagedNextcloudRelativePath(context.nextcloudUserId, auditFallback.originalPath || null),
+    librarySourceKey: auditFallback.librarySourceKey || null,
+    source: 'audit-log',
+  };
+}
+
+function lookupDeleteTargetFromAuditLog(assetId, nextcloudUserId) {
+  if (!fs.existsSync(auditLogPath)) {
+    return null;
+  }
+
+  const lines = fs.readFileSync(auditLogPath, 'utf8').trim().split('\n').filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    let entry;
+    try {
+      entry = JSON.parse(lines[index]);
+    } catch {
+      continue;
+    }
+
+    if (entry?.assetId !== assetId) {
+      continue;
+    }
+
+    if (nextcloudUserId && entry?.nextcloudUserId && entry.nextcloudUserId !== nextcloudUserId) {
+      continue;
+    }
+
+    if (!['nextcloud-trash-applied', 'nextcloud-restore-applied', 'nextcloud-delete-applied'].includes(entry.kind)) {
+      continue;
+    }
+
+    return {
+      originalPath: entry.originalPath || null,
+      relativePath: entry.relativePath || null,
+      librarySourceKey: entry.librarySourceKey || null,
+      kind: entry.kind,
+      eventId: entry.eventId || null,
+    };
+  }
+
+  return null;
 }
 
 function buildUserDestinationPath(context, destinationRelative) {
@@ -1047,6 +1309,50 @@ try {
   });
 }
 
+function runNextcloudFileTrashDeletePermanent(nextcloudUserId, relativePath) {
+  return runNextcloudPhpJson(`
+require '/var/www/html/lib/base.php';
+$userId = $argv[1] ?? '';
+$relativePath = ltrim($argv[2] ?? '', '/');
+if ($userId === '' || $relativePath === '') {
+  echo json_encode(['status' => 'error', 'message' => 'Missing user or path']);
+  exit(1);
+}
+try {
+  \\OC_Util::tearDownFS();
+  \\OC_Util::setupFS($userId);
+  \\OC_User::setUserId($userId);
+  $userManager = \\OC::$server->get(\\OCP\\IUserManager::class);
+  $trashManager = \\OC::$server->get(\\OCA\\Files_Trashbin\\Trash\\ITrashManager::class);
+  $user = $userManager->get($userId);
+  if (!$user) {
+    echo json_encode(['status' => 'error', 'message' => 'Unknown Nextcloud user']);
+    exit(1);
+  }
+  $match = null;
+  foreach ($trashManager->listTrashRoot($user) as $item) {
+    if (ltrim($item->getOriginalLocation(), '/') !== $relativePath) {
+      continue;
+    }
+    if ($match === null || $item->getDeletedTime() > $match->getDeletedTime()) {
+      $match = $item;
+    }
+  }
+  if ($match === null) {
+    echo json_encode(['status' => 'not_found', 'message' => 'Matching trash item already deleted or missing']);
+    exit(0);
+  }
+  $trashManager->removeItem($match);
+  echo json_encode(['status' => 'deleted', 'message' => 'Removed from Nextcloud trash']);
+} catch (\\Throwable $error) {
+  echo json_encode(['status' => 'error', 'message' => $error->getMessage()]);
+  exit(1);
+}
+`, [nextcloudUserId, relativePath], {
+    successStatus: 'deleted',
+  });
+}
+
 function runNextcloudOcc(command, options) {
   const successStatus = options.successStatus;
   const idempotentPatterns = options.idempotentPatterns || [];
@@ -1206,6 +1512,47 @@ function loadTrashSyncState() {
 
 function saveTrashSyncState(state) {
   fs.writeFileSync(trashSyncStatePath, JSON.stringify(state, null, 2));
+}
+
+function loadDeleteLookupIndex() {
+  const state = loadJson(deleteLookupIndexPath, {
+    assets: {},
+  });
+  state.assets = state.assets && typeof state.assets === 'object' ? state.assets : {};
+  return state;
+}
+
+function saveDeleteLookupIndex(state) {
+  fs.writeFileSync(deleteLookupIndexPath, JSON.stringify(state, null, 2));
+}
+
+function pruneDeleteLookupIndex(state) {
+  const cutoff = Date.now() - deleteLookupTtlMs;
+  for (const [assetId, entry] of Object.entries(state.assets || {})) {
+    const timestamp = Date.parse(entry?.updatedAt || '');
+    if (Number.isNaN(timestamp) || timestamp < cutoff) {
+      delete state.assets[assetId];
+    }
+  }
+  return state;
+}
+
+function refreshDeleteLookupEntry(state, entry) {
+  if (!entry?.assetId || !entry?.nextcloudUserId || !entry?.originalPath) {
+    return;
+  }
+
+  const existing = state.assets[entry.assetId] || {};
+  state.assets[entry.assetId] = {
+    ...existing,
+    assetId: entry.assetId,
+    nextcloudUserId: entry.nextcloudUserId,
+    originalPath: entry.originalPath,
+    relativePath: entry.relativePath || existing.relativePath || null,
+    librarySourceKey: entry.librarySourceKey || existing.librarySourceKey || null,
+    lastSeenEventType: entry.lastSeenEventType || existing.lastSeenEventType || null,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 function recordTrashSyncEntry(state, entry) {

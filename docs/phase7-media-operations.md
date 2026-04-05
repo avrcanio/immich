@@ -18,6 +18,18 @@ This document captures the initial implementation skeleton for issue #7.
   - `trash-assets`
   - `confirm-delete-assets`
   - `move-assets-to-folder`
+- Managed trash lifecycle events from Immich now mirror to Nextcloud:
+  - `Delete` moves managed files to Nextcloud trash
+  - `Restore` restores managed files from Nextcloud trash
+  - `Permanent delete` and `Empty trash` remove matching managed items from Nextcloud trash
+  - `AssetDeleteAll` fallback resolution now uses:
+    - `trash-sync-state.json`
+    - `delete-lookup-index.json`
+    - `audit.log`
+  - audit markers distinguish the fallback layer:
+    - `resolved_from_trash_sync_state`
+    - `resolved_from_delete_lookup_index`
+    - `resolved_from_audit_log`
 
 ## Security Model
 
@@ -30,6 +42,33 @@ This document captures the initial implementation skeleton for issue #7.
   - fetching each requested asset through the user-scoped Immich API
   - checking `ownerId` and/or original path against the user's library root
 - This avoids a global admin API mutation path for normal user operations.
+
+## Bridge Password Recovery Flow
+
+If a managed Immich user exists in `managed-state.json` but is missing from `credentials.json`, the bridge now supports an admin recovery flow for issuing a direct-login password without recreating the user.
+
+Preview:
+
+```bash
+docker compose exec nextcloud-immich-bridge \
+  node /app/bridge.js issue-password --user carolina@vitalgroupsa.com
+```
+
+Apply:
+
+```bash
+docker compose exec nextcloud-immich-bridge \
+  node /app/bridge.js issue-password --user carolina@vitalgroupsa.com --apply
+```
+
+Behavior:
+
+- resolves the managed user by email or `nextcloudUserId`
+- generates a new random Immich password unless `--password <value>` is provided
+- updates the Immich account through the admin API
+- stores the password in `docker-data/bridge/credentials.json`
+- writes an audit record to `docker-data/bridge/last-password-issue.json`
+- keeps `shouldChangePassword=true` by default for the next direct Immich login
 
 ## Runtime Modes
 
@@ -134,7 +173,6 @@ The service itself remains deployed with `MEDIA_OPS_DRY_RUN=true`, but the follo
 
 - EXIF/XMP writeback is still a planned operation, not a live worker yet.
 - Physical folder moves are still planned operations, not live storage mutations.
-- Confirmed delete does not perform hard delete unless explicit live flags are enabled.
 - There is no external auth layer in front of the operations API yet.
 - There is no queue worker split yet; this is a single-service v1 skeleton.
 - Album rename, remove-membership, and delete are not yet written back to Nextcloud.

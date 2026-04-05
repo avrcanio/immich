@@ -42,9 +42,11 @@ services:
       BRIDGE_SOURCE_ROOT: ${BRIDGE_SOURCE_ROOT:-/external-libraries/nextcloud-data}
       BRIDGE_LIBRARY_ROOT: ${BRIDGE_LIBRARY_ROOT:-/external-libraries/nextcloud-data}
       BRIDGE_STATE_DIR: /state
+      BRIDGE_NEXTCLOUD_CONTAINER_NAME: ${BRIDGE_NEXTCLOUD_CONTAINER_NAME:-nextcloud}
     volumes:
       - /opt/stacks/nextcloud/docker-data/nextcloud/data:/external-libraries/nextcloud-data:ro
       - ./docker-data/bridge:/state
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - immich-server
     restart: unless-stopped

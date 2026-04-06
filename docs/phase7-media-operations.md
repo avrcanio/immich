@@ -169,9 +169,37 @@ The service itself remains deployed with `MEDIA_OPS_DRY_RUN=true`, but the follo
   - `nextcloudWritebackStatus`
   - `nextcloudWritebackErrors`
 
+## EXIF Date Fix Utility
+
+- The stack now includes a dedicated EXIF date-fix utility UI exposed through Immich utilities.
+- The utility looks for assets whose filename contains a trustworthy date pattern and where the stored capture date is either missing or suspicious.
+- Supported filename families currently include:
+  - `YYYYMMDD_HHMMSS`
+  - `YYYY-MM-DD HH.MM.SS`
+  - `PXL_YYYYMMDD_HHMMSS`
+  - `Screenshot_YYYYMMDD-HHMMSS`
+  - `signal-YYYY-MM-DD-HHMMSS`
+  - `IMG-YYYYMMDD-WA...` and `VID-YYYYMMDD-WA...`
+  - `FB_IMG_<epoch-ms>`
+  - `FACE_SC_<epoch-ms>`
+  - `PicPlus_<epoch-ms>`
+- When a match is found, the utility normalizes the detected value into:
+  - Immich metadata update payloads
+  - file-level EXIF/XMP writeback via `exiftool`
+- The writeback path is now verified for:
+  - `jpg`
+  - `jpeg`
+  - `png`
+  - `webp`
+  - `gif`
+  - `heic`
+  - `heif`
+- The utility is still intentionally conservative:
+  - it only proposes dates when the filename pattern is recognized with confidence
+  - assets with opaque names still require manual review or another source of truth
+
 ## Known Gaps
 
-- EXIF/XMP writeback is still a planned operation, not a live worker yet.
 - Physical folder moves are still planned operations, not live storage mutations.
 - There is no external auth layer in front of the operations API yet.
 - There is no queue worker split yet; this is a single-service v1 skeleton.

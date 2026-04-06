@@ -72,14 +72,32 @@ services:
       MEDIA_OPS_INTERNAL_EVENT_SECRET: ${MEDIA_OPS_INTERNAL_EVENT_SECRET}
       MEDIA_OPS_NEXTCLOUD_TRASH_SYNC_ENABLED: ${MEDIA_OPS_NEXTCLOUD_TRASH_SYNC_ENABLED:-false}
       MEDIA_OPS_NEXTCLOUD_TRASH_RESTORE_ENABLED: ${MEDIA_OPS_NEXTCLOUD_TRASH_RESTORE_ENABLED:-false}
+      MEDIA_OPS_SMART_ALBUMS_ENABLED: ${MEDIA_OPS_SMART_ALBUMS_ENABLED:-false}
+      MEDIA_OPS_SMART_ALBUMS_DRY_RUN: ${MEDIA_OPS_SMART_ALBUMS_DRY_RUN:-true}
+      MEDIA_OPS_SMART_ALBUMS_DOCUMENTS_ENABLED: ${MEDIA_OPS_SMART_ALBUMS_DOCUMENTS_ENABLED:-true}
+      MEDIA_OPS_SMART_ALBUMS_SCREENSHOTS_ENABLED: ${MEDIA_OPS_SMART_ALBUMS_SCREENSHOTS_ENABLED:-true}
+      MEDIA_OPS_SMART_ALBUMS_WHATSAPP_ENABLED: ${MEDIA_OPS_SMART_ALBUMS_WHATSAPP_ENABLED:-true}
+      MEDIA_OPS_UTILITY_TIMEZONE: ${MEDIA_OPS_UTILITY_TIMEZONE:-Europe/Zagreb}
     volumes:
-      - /opt/stacks/nextcloud/docker-data/nextcloud/data:/external-libraries/nextcloud-data:ro
+      - /opt/stacks/nextcloud/docker-data/nextcloud/data:/external-libraries/nextcloud-data
       - ./docker-data/bridge:/bridge-state:ro
       - ./docker-data/media-operations:/state
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - immich-server
     restart: unless-stopped
+    networks:
+      - default
+      - proxy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.immich-exifdatefix-api.rule=Host(`${IMMICH_DOMAIN}`) && PathPrefix(`/utilities/exifdatefix/api`)
+      - traefik.http.routers.immich-exifdatefix-api.priority=100
+      - traefik.http.routers.immich-exifdatefix-api.entrypoints=websecure
+      - traefik.http.routers.immich-exifdatefix-api.tls=true
+      - traefik.http.routers.immich-exifdatefix-api.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-cloudflare}
+      - traefik.http.services.immich-exifdatefix-api.loadbalancer.server.port=8091
 
   immich-machine-learning:
     container_name: immich_machine_learning

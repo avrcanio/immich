@@ -1,10 +1,11 @@
 FROM node:22-alpine
 
-RUN apk add --no-cache docker-cli
+RUN apk add --no-cache docker-cli exiftool
 
 WORKDIR /app
 
 COPY server.js /app/server.js
+COPY utilities.html /app/utilities.html
 
 EXPOSE 8091
 

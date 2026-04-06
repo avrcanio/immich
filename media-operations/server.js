@@ -21,6 +21,12 @@ const config = {
   internalEventSecret: env('MEDIA_OPS_INTERNAL_EVENT_SECRET', ''),
   nextcloudTrashSyncEnabled: parseBoolean(env('MEDIA_OPS_NEXTCLOUD_TRASH_SYNC_ENABLED', 'false')),
   nextcloudTrashRestoreEnabled: parseBoolean(env('MEDIA_OPS_NEXTCLOUD_TRASH_RESTORE_ENABLED', 'false')),
+  smartAlbumsEnabled: parseBoolean(env('MEDIA_OPS_SMART_ALBUMS_ENABLED', 'false')),
+  smartAlbumsDryRun: parseBoolean(env('MEDIA_OPS_SMART_ALBUMS_DRY_RUN', 'true')),
+  smartAlbumsDocumentsEnabled: parseBoolean(env('MEDIA_OPS_SMART_ALBUMS_DOCUMENTS_ENABLED', 'true')),
+  smartAlbumsScreenshotsEnabled: parseBoolean(env('MEDIA_OPS_SMART_ALBUMS_SCREENSHOTS_ENABLED', 'true')),
+  smartAlbumsWhatsAppEnabled: parseBoolean(env('MEDIA_OPS_SMART_ALBUMS_WHATSAPP_ENABLED', 'true')),
+  utilityTimezone: env('MEDIA_OPS_UTILITY_TIMEZONE', 'Europe/Zagreb'),
   dbHostname: env('DB_HOSTNAME', 'postgis'),
   dbUsername: env('DB_USERNAME', 'immich'),
   dbPassword: env('DB_PASSWORD', ''),
@@ -34,9 +40,27 @@ const lastOperationPath = path.join(config.stateDir, 'last-operation.json');
 const auditLogPath = path.join(config.stateDir, 'audit.log');
 const trashSyncStatePath = path.join(config.stateDir, 'trash-sync-state.json');
 const deleteLookupIndexPath = path.join(config.stateDir, 'delete-lookup-index.json');
+const utilityStatePath = path.join(config.stateDir, 'utility-state.json');
+const utilitiesHtmlPath = '/app/utilities.html';
 const deleteLookupTtlMs = 30 * 24 * 60 * 60 * 1000;
+const utilityRowsCacheTtlMs = 5 * 60 * 1000;
+const utilityCandidateQueueCacheTtlMs = 5 * 60 * 1000;
+const SUPPORTED_UTILITY_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif']);
+const SMART_ALBUM_DEFINITIONS = Object.freeze([
+  { name: 'No Faces', matcher: (input) => input.faceCount === 0 },
+  { name: 'Screenshots', matcher: (input) => config.smartAlbumsScreenshotsEnabled && isScreenshotCandidate(input.fileName) },
+  { name: 'WhatsApp', matcher: (input) => config.smartAlbumsWhatsAppEnabled && isWhatsAppCandidate(input.fileName) },
+  {
+    name: 'Documents',
+    matcher: (input) =>
+      config.smartAlbumsDocumentsEnabled && input.faceCount === 0 && isDocumentCandidate(input.fileName),
+  },
+]);
 
 fs.mkdirSync(config.stateDir, { recursive: true });
+const utilityRowsCache = new Map();
+const utilityCandidateQueueCache = new Map();
+const utilityBackgroundJobs = new Map();
 
 async function main() {
   const { command, args } = parseCommand(process.argv.slice(2));
@@ -64,6 +88,9 @@ async function main() {
 async function serve() {
   const server = http.createServer(async (request, response) => {
     try {
+      const requestUrl = new URL(request.url || '/', 'http://media-operations.local');
+      const utilityApiPath = requestUrl.pathname.replace(/^\/utilities\/exifdatefix\/api/, '/utility/exifdatefix/api');
+
       if (request.method === 'GET' && request.url === '/healthz') {
         return respondJson(response, 200, {
           status: 'ok',
@@ -76,11 +103,59 @@ async function serve() {
           nextcloudTrashSyncEnabled: config.nextcloudTrashSyncEnabled,
           nextcloudTrashRestoreEnabled: config.nextcloudTrashRestoreEnabled,
           immichEventWebhookEnabled: Boolean(config.internalEventSecret),
+          smartAlbumsEnabled: config.smartAlbumsEnabled,
+          smartAlbumsDryRun: config.smartAlbumsDryRun,
         });
       }
 
       if (request.method === 'GET' && request.url === '/capabilities') {
         return respondJson(response, 200, getCapabilities());
+      }
+
+      if (request.method === 'GET' && (requestUrl.pathname === '/utility/exifdatefix' || requestUrl.pathname === '/utility/exifdatefix/')) {
+        return respondHtml(response, 200, fs.readFileSync(utilitiesHtmlPath, 'utf8'));
+      }
+
+      if (request.method === 'GET' && utilityApiPath === '/utility/exifdatefix/api/date-from-filename/next') {
+        const payload = await buildDateFromFilenameResponse(request);
+        return respondJson(response, 200, payload);
+      }
+
+      if (request.method === 'GET' && utilityApiPath === '/utility/exifdatefix/api/date-from-filename/status') {
+        const payload = await buildDateFromFilenameResponse(request, { includeCandidate: false });
+        return respondJson(response, 200, payload);
+      }
+
+      if (request.method === 'GET' && utilityApiPath === '/utility/exifdatefix/api/date-from-filename/background-status') {
+        const payload = await buildDateFromFilenameBackgroundStatusResponse(request);
+        return respondJson(response, 200, payload);
+      }
+
+      if (request.method === 'POST' && utilityApiPath === '/utility/exifdatefix/api/date-from-filename/skip') {
+        verifyUtilityMutationRequest(request);
+        const payload = await readJsonBody(request);
+        const result = await handleDateFromFilenameSkip(request, payload);
+        return respondJson(response, 200, result);
+      }
+
+      if (request.method === 'POST' && utilityApiPath === '/utility/exifdatefix/api/date-from-filename/apply') {
+        verifyUtilityMutationRequest(request);
+        const payload = await readJsonBody(request);
+        const result = await handleDateFromFilenameApply(request, payload);
+        return respondJson(response, 200, result);
+      }
+
+      if (request.method === 'POST' && utilityApiPath === '/utility/exifdatefix/api/date-from-filename/delete') {
+        verifyUtilityMutationRequest(request);
+        const payload = await readJsonBody(request);
+        const result = await handleDateFromFilenameDelete(request, payload);
+        return respondJson(response, 200, result);
+      }
+
+      if (request.method === 'POST' && utilityApiPath === '/utility/exifdatefix/api/date-from-filename/background-apply') {
+        verifyUtilityMutationRequest(request);
+        const result = await handleDateFromFilenameBackgroundApply(request);
+        return respondJson(response, 200, result);
       }
 
       if (request.method === 'POST' && request.url === '/operations') {
@@ -98,7 +173,8 @@ async function serve() {
 
       respondJson(response, 404, { message: 'Not found' });
     } catch (error) {
-      respondJson(response, 400, {
+      const statusCode = error.statusCode || 400;
+      respondJson(response, statusCode, {
         message: error.message,
       });
     }
@@ -120,6 +196,9 @@ function getCapabilities() {
     nextcloudTrashSyncEnabled: config.nextcloudTrashSyncEnabled,
     nextcloudTrashRestoreEnabled: config.nextcloudTrashRestoreEnabled,
     immichEventWebhookEnabled: Boolean(config.internalEventSecret),
+    smartAlbumsEnabled: config.smartAlbumsEnabled,
+    smartAlbumsDryRun: config.smartAlbumsDryRun,
+    supportedSmartAlbums: getManagedSmartAlbumNames(),
     supported: [
       'create-album',
       'update-album',
@@ -131,6 +210,7 @@ function getCapabilities() {
       'confirm-delete-assets',
       'move-assets-to-folder',
       'immich-trash-webhook',
+      'reconcile-smart-albums',
     ],
     destructiveOperationsRequireApply: [
       'confirm-delete-assets',
@@ -138,6 +218,1384 @@ function getCapabilities() {
     ],
     writebackMode: config.writebackEnabled ? 'opt-in-live' : 'audit-only',
   };
+}
+
+async function buildDateFromFilenameResponse(request, options = {}) {
+  const includeCandidate = options.includeCandidate !== false;
+  const context = await createUtilityContextFromRequest(request);
+  const queue = getDateFromFilenameQueue(context, options);
+
+  return {
+    status: {
+      remaining: queue.remaining,
+      total: queue.total,
+      applied: queue.applied,
+      skipped: queue.skipped,
+      deleted: queue.deleted,
+    },
+    candidate: includeCandidate ? queue.candidate : null,
+  };
+}
+
+async function handleDateFromFilenameSkip(request, payload) {
+  const context = await createUtilityContextFromRequest(request);
+  const assetId = requiredString(payload.assetId, 'assetId');
+  const queue = getDateFromFilenameQueue(context);
+
+  if (!queue.candidate || queue.candidate.assetId !== assetId) {
+    throw httpError(409, 'Asset is no longer the active utility candidate');
+  }
+
+  const state = loadUtilityState();
+  const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+  userState.skipped[assetId] = {
+    decidedAt: new Date().toISOString(),
+    fileName: queue.candidate.fileName,
+    proposedDateTimeIso: queue.candidate.proposedDateTimeIso,
+    parserReason: queue.candidate.parserReason,
+  };
+  saveUtilityState(state);
+
+  writeAuditEntry({
+    kind: 'utility-date-from-filename-skip',
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+    assetId,
+    fileName: queue.candidate.fileName,
+    proposedDateTimeIso: queue.candidate.proposedDateTimeIso,
+    parserReason: queue.candidate.parserReason,
+  });
+
+  markUtilityQueueAssetProcessed(context, assetId);
+  return buildDateFromFilenameResponseFromContext(context);
+}
+
+async function handleDateFromFilenameApply(request, payload) {
+  const context = await createUtilityContextFromRequest(request, { requireAuthenticatedContext: true });
+  const assetId = requiredString(payload.assetId, 'assetId');
+  const queue = getDateFromFilenameQueue(context);
+
+  if (!queue.candidate || queue.candidate.assetId !== assetId) {
+    throw httpError(409, 'Asset is no longer the active utility candidate');
+  }
+
+  const assetRecord = getUtilityAssetRecord(context, assetId);
+  if (!shouldOfferDateCorrection(assetRecord, queue.candidate)) {
+    throw httpError(409, 'Asset no longer requires a date correction');
+  }
+
+  applyExifDateTime(assetRecord.originalPath, queue.candidate.proposedDateTimeExif, getFileExtension(assetRecord.fileName));
+
+  await immichRequest(context.accessToken, 'PUT', '/assets', {
+    ids: [assetId],
+    dateTimeOriginal: queue.candidate.proposedDateTimeIso,
+  });
+
+  const state = loadUtilityState();
+  const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+  userState.applied[assetId] = {
+    decidedAt: new Date().toISOString(),
+    fileName: queue.candidate.fileName,
+    proposedDateTimeIso: queue.candidate.proposedDateTimeIso,
+    parserReason: queue.candidate.parserReason,
+    originalPath: assetRecord.originalPath,
+  };
+  delete userState.skipped[assetId];
+  saveUtilityState(state);
+
+  writeAuditEntry({
+    kind: 'utility-date-from-filename-apply',
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+    assetId,
+    fileName: queue.candidate.fileName,
+    originalPath: assetRecord.originalPath,
+    proposedDateTimeIso: queue.candidate.proposedDateTimeIso,
+    parserReason: queue.candidate.parserReason,
+  });
+
+  markUtilityQueueAssetProcessed(context, assetId);
+  return buildDateFromFilenameResponseFromContext(context);
+}
+
+async function handleDateFromFilenameDelete(request, payload) {
+  const context = await createUtilityContextFromRequest(request, { requireAuthenticatedContext: true });
+  const assetId = requiredString(payload.assetId, 'assetId');
+  const queue = getDateFromFilenameQueue(context);
+
+  if (!queue.candidate || queue.candidate.assetId !== assetId) {
+    throw httpError(409, 'Asset is no longer the active utility candidate');
+  }
+
+  const assetRecord = getUtilityAssetRecord(context, assetId);
+  await immichRequest(context.accessToken, 'DELETE', '/assets', {
+    ids: [assetId],
+    force: false,
+  });
+
+  const state = loadUtilityState();
+  const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+  userState.deleted[assetId] = {
+    decidedAt: new Date().toISOString(),
+    fileName: queue.candidate.fileName,
+    originalPath: assetRecord.originalPath || null,
+    deleteMode: 'trash',
+  };
+  delete userState.skipped[assetId];
+  saveUtilityState(state);
+
+  writeAuditEntry({
+    kind: 'utility-date-from-filename-delete',
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+    assetId,
+    fileName: queue.candidate.fileName,
+    originalPath: assetRecord.originalPath || null,
+    deleteMode: 'trash',
+  });
+
+  markUtilityQueueAssetProcessed(context, assetId);
+  return buildDateFromFilenameResponseFromContext(context);
+}
+
+async function buildDateFromFilenameBackgroundStatusResponse(request) {
+  const context = await createUtilityContextFromRequest(request);
+  const job = getUtilityBackgroundJob(context.nextcloudUserId);
+  return {
+    job: job ? sanitizeUtilityBackgroundJob(job) : null,
+  };
+}
+
+async function handleDateFromFilenameBackgroundApply(request) {
+  const context = await createUtilityContextFromRequest(request, { requireAuthenticatedContext: true });
+  const existing = getUtilityBackgroundJob(context.nextcloudUserId);
+  if (existing && existing.status === 'running') {
+    return {
+      started: false,
+      job: sanitizeUtilityBackgroundJob(existing),
+    };
+  }
+
+  const state = loadUtilityState();
+  const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+  const queue = getDateFromFilenameQueue(context);
+  const job = {
+    id: crypto.randomUUID(),
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    totalAtStart: queue.remaining,
+    processed: 0,
+    applied: 0,
+    failed: Object.keys(userState.failed || {}).length,
+    deleted: Object.keys(userState.deleted || {}).length,
+    skipped: Object.keys(userState.skipped || {}).length,
+    lastAssetId: null,
+    lastFileName: null,
+    lastError: null,
+  };
+  utilityBackgroundJobs.set(context.nextcloudUserId, job);
+  void runUtilityBackgroundApplyJob(context.nextcloudUserId, job.id);
+
+  return {
+    started: true,
+    job: sanitizeUtilityBackgroundJob(job),
+  };
+}
+
+function buildDateFromFilenameResponseFromContext(context, options = {}) {
+  const includeCandidate = options.includeCandidate !== false;
+  const queue = getDateFromFilenameQueue(context, options);
+
+  return {
+    status: {
+      remaining: queue.remaining,
+      total: queue.total,
+      applied: queue.applied,
+      skipped: queue.skipped,
+      deleted: queue.deleted,
+      failed: queue.failed,
+    },
+    candidate: includeCandidate ? queue.candidate : null,
+  };
+}
+
+async function createUtilityContextFromRequest(request, options = {}) {
+  const sessionUser = await getImmichSessionUser(request);
+  const baseContext = await createUserContextByImmichUserId(sessionUser.id);
+  if (!options.requireAuthenticatedContext) {
+    return baseContext;
+  }
+
+  return {
+    ...baseContext,
+    accessToken: {
+      sessionCookie: request.headers.cookie,
+    },
+  };
+}
+
+async function getImmichSessionUser(request) {
+  const proxiedUserIdHeader = request.headers['x-immich-user-id'];
+  const proxySecretHeader = request.headers['x-media-ops-proxy-secret'];
+  const proxiedUserId = Array.isArray(proxiedUserIdHeader) ? proxiedUserIdHeader[0] : proxiedUserIdHeader;
+  const proxySecret = Array.isArray(proxySecretHeader) ? proxySecretHeader[0] : proxySecretHeader;
+  if (config.internalEventSecret && proxySecret === config.internalEventSecret && proxiedUserId) {
+    return { id: proxiedUserId };
+  }
+
+  const cookie = request.headers.cookie;
+  if (!cookie) {
+    throw httpError(401, 'Authentication required');
+  }
+
+  const response = await fetch(`${config.immichApiUrl}/users/me`, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+      Cookie: cookie,
+    },
+  });
+
+  const text = await response.text();
+  const data = text ? safeJsonParse(text) : null;
+  if (response.status === 401) {
+    throw httpError(401, 'Authentication required');
+  }
+  if (!response.ok || !data?.id) {
+    throw httpError(403, `Unable to resolve authenticated Immich user: ${text}`);
+  }
+  return data;
+}
+
+function getDateFromFilenameQueue(context, options = {}) {
+  const state = loadUtilityState();
+  const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+
+  if (!options.rows && !options.excludeAssetIds?.length) {
+    const materializedQueue = getMaterializedUtilityCandidateQueue(context, userState);
+    return {
+      candidate: materializedQueue.candidates[0] || null,
+      remaining: materializedQueue.candidates.length,
+      total: materializedQueue.total,
+      applied: Object.keys(userState.applied || {}).length,
+      skipped: Object.keys(userState.skipped || {}).length,
+      deleted: Object.keys(userState.deleted || {}).length,
+      failed: Object.keys(userState.failed || {}).length,
+    };
+  }
+
+  const rows = options.rows || getDateFromFilenameRows(context);
+  const excludedAssetIds = new Set(options.excludeAssetIds || []);
+  const candidates = buildUtilityCandidates(rows, userState, excludedAssetIds);
+
+  return {
+    candidate: candidates[0] || null,
+    remaining: candidates.length,
+    total: rows.length,
+    applied: Object.keys(userState.applied || {}).length,
+    skipped: Object.keys(userState.skipped || {}).length,
+    deleted: Object.keys(userState.deleted || {}).length,
+    failed: Object.keys(userState.failed || {}).length,
+  };
+}
+
+function getMaterializedUtilityCandidateQueue(context, userState) {
+  const cacheKey = buildUtilityRowsCacheKey(context);
+  const cached = utilityCandidateQueueCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached;
+  }
+
+  const rows = getDateFromFilenameRows(context);
+  const materialized = {
+    total: rows.length,
+    candidates: buildUtilityCandidates(rows, userState),
+    expiresAt: Date.now() + utilityCandidateQueueCacheTtlMs,
+  };
+  utilityCandidateQueueCache.set(cacheKey, materialized);
+  return materialized;
+}
+
+function shouldExcludeFailedUtilityCandidate(userState, assetId) {
+  const failure = userState.failed && userState.failed[assetId];
+  if (!failure) {
+    return false;
+  }
+  if (failure.permanent) {
+    return true;
+  }
+  if (failure.nextRetryAt) {
+    const nextRetryAt = Date.parse(failure.nextRetryAt);
+    if (Number.isFinite(nextRetryAt) && nextRetryAt > Date.now()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildUtilityCandidates(rows, userState, excludedAssetIds = new Set()) {
+  const candidates = [];
+
+  for (const row of rows) {
+    const candidate = mapUtilityRowToCandidate(row);
+    if (!candidate) {
+      continue;
+    }
+    if (excludedAssetIds.has(candidate.assetId)) {
+      continue;
+    }
+    if (
+      (userState.applied && userState.applied[candidate.assetId]) ||
+      (userState.skipped && userState.skipped[candidate.assetId]) ||
+      (userState.deleted && userState.deleted[candidate.assetId]) ||
+      shouldExcludeFailedUtilityCandidate(userState, candidate.assetId)
+    ) {
+      continue;
+    }
+    candidates.push(candidate);
+  }
+
+  return candidates;
+}
+
+function markUtilityQueueAssetProcessed(context, assetId) {
+  const cacheKey = buildUtilityRowsCacheKey(context);
+  const cached = utilityCandidateQueueCache.get(cacheKey);
+  if (!cached) {
+    return;
+  }
+
+  cached.candidates = cached.candidates.filter((candidate) => candidate.assetId !== assetId);
+  cached.expiresAt = Date.now() + utilityCandidateQueueCacheTtlMs;
+}
+
+function getUtilityBackgroundJob(nextcloudUserId) {
+  const job = utilityBackgroundJobs.get(nextcloudUserId);
+  if (!job) {
+    return null;
+  }
+  return job;
+}
+
+function sanitizeUtilityBackgroundJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    totalAtStart: job.totalAtStart,
+    processed: job.processed,
+    applied: job.applied,
+    failed: job.failed,
+    skipped: job.skipped,
+    deleted: job.deleted,
+    lastAssetId: job.lastAssetId,
+    lastFileName: job.lastFileName,
+    lastError: job.lastError,
+  };
+}
+
+function isRetryableUtilityBackgroundError(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  return (
+    message.includes('fetch failed') ||
+    message.includes('econnreset') ||
+    message.includes('econnrefused') ||
+    message.includes('etimedout') ||
+    message.includes('socket hang up') ||
+    message.includes('502') ||
+    message.includes('503') ||
+    message.includes('504')
+  );
+}
+
+async function sleepMs(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runUtilityBackgroundApplyJob(nextcloudUserId, jobId) {
+  const job = utilityBackgroundJobs.get(nextcloudUserId);
+  if (!job || job.id !== jobId) {
+    return;
+  }
+
+  try {
+    const context = await createUserContext(nextcloudUserId);
+
+    while (true) {
+      const queue = getDateFromFilenameQueue(context);
+      const candidate = queue.candidate;
+      if (!candidate) {
+        job.status = 'completed';
+        job.finishedAt = new Date().toISOString();
+        job.lastError = null;
+        return;
+      }
+
+      job.lastAssetId = candidate.assetId;
+      job.lastFileName = candidate.fileName;
+      let shouldKeepCandidateQueued = false;
+
+      try {
+        let assetRecord = null;
+        let lastAttemptError = null;
+        const maxAttempts = 3;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          try {
+            assetRecord = getUtilityAssetRecord(context, candidate.assetId);
+            if (!shouldOfferDateCorrection(assetRecord, candidate)) {
+              throw new Error('Asset no longer requires a date correction');
+            }
+
+            applyExifDateTime(assetRecord.originalPath, candidate.proposedDateTimeExif, getFileExtension(assetRecord.fileName));
+            await immichRequest(context.accessToken, 'PUT', '/assets', {
+              ids: [candidate.assetId],
+              dateTimeOriginal: candidate.proposedDateTimeIso,
+            });
+            lastAttemptError = null;
+            break;
+          } catch (error) {
+            lastAttemptError = error;
+            if (attempt >= maxAttempts || !isRetryableUtilityBackgroundError(error)) {
+              throw error;
+            }
+            await sleepMs(750 * attempt);
+          }
+        }
+
+        const state = loadUtilityState();
+        const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+        userState.applied[candidate.assetId] = {
+          decidedAt: new Date().toISOString(),
+          fileName: candidate.fileName,
+          proposedDateTimeIso: candidate.proposedDateTimeIso,
+          parserReason: candidate.parserReason,
+          originalPath: assetRecord.originalPath,
+          background: true,
+        };
+        delete userState.skipped[candidate.assetId];
+        delete userState.failed[candidate.assetId];
+        saveUtilityState(state);
+
+        writeAuditEntry({
+          kind: 'utility-date-from-filename-apply-background',
+          nextcloudUserId: context.nextcloudUserId,
+          immichUserId: context.immichUserId,
+          assetId: candidate.assetId,
+          fileName: candidate.fileName,
+          originalPath: assetRecord.originalPath,
+          proposedDateTimeIso: candidate.proposedDateTimeIso,
+          parserReason: candidate.parserReason,
+        });
+
+        job.applied += 1;
+        job.lastError = null;
+      } catch (error) {
+        const state = loadUtilityState();
+        const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+        const previousFailure = userState.failed[candidate.assetId] || {};
+        const nextAttemptCount = Number(previousFailure.attempts || 0) + 1;
+        const isRetryable = isRetryableUtilityBackgroundError(error);
+        const shouldRetryLater = isRetryable && nextAttemptCount < 10;
+        const nextRetryAt = shouldRetryLater ? new Date(Date.now() + Math.min(60000, 5000 * nextAttemptCount)).toISOString() : null;
+        shouldKeepCandidateQueued = shouldRetryLater;
+        userState.failed[candidate.assetId] = {
+          decidedAt: new Date().toISOString(),
+          fileName: candidate.fileName,
+          message: error.message,
+          attempts: nextAttemptCount,
+          permanent: !shouldRetryLater,
+          nextRetryAt,
+          background: true,
+        };
+        saveUtilityState(state);
+
+        writeAuditEntry({
+          kind: 'utility-date-from-filename-background-error',
+          nextcloudUserId: context.nextcloudUserId,
+          immichUserId: context.immichUserId,
+          assetId: candidate.assetId,
+          fileName: candidate.fileName,
+          message: error.message,
+          retryScheduled: shouldRetryLater,
+          nextRetryAt,
+        });
+
+        job.failed += 1;
+        job.lastError = error.message;
+      }
+
+      job.processed += 1;
+      if (!shouldKeepCandidateQueued) {
+        markUtilityQueueAssetProcessed(context, candidate.assetId);
+      }
+    }
+  } catch (error) {
+    job.status = 'failed';
+    job.finishedAt = new Date().toISOString();
+    job.lastError = error.message;
+  }
+}
+
+function getDateFromFilenameRows(context) {
+  const cacheKey = buildUtilityRowsCacheKey(context);
+  const cached = utilityRowsCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.rows;
+  }
+
+  const libraryPathCondition = buildLibraryPathSqlCondition(context);
+  const sql = `
+    select
+      a.id,
+      a."originalFileName",
+      a."originalPath",
+      a."fileCreatedAt",
+      a."localDateTime",
+      ae."dateTimeOriginal"
+    from asset a
+    left join asset_exif ae on ae."assetId" = a.id
+    where a."ownerId" = ${sqlString(context.immichUserId)}
+      and a."deletedAt" is null
+      and a.type = 'IMAGE'
+      and (${libraryPathCondition})
+      and lower(a."originalFileName") ~ '\\.(jpg|jpeg|png|webp|gif|heic|heif)$'
+      and lower(a."originalFileName") ~ '(screenshot_|pxl_|signal-|fb_img_\\d{13}|face_sc_\\d{13}|picplus_\\d{13}|img[-_]\\d{8}-wa|vid[-_]\\d{8}-wa|\\d{8}[_ -]\\d{6}|\\d{4}-\\d{2}-\\d{2}[ _. -]\\d{2}[.:_-]\\d{2}[.:_-]\\d{2})'
+    order by a."fileCreatedAt" asc, a.id asc;
+  `;
+
+  const rows = runPostgresRowsQuery(sql).map((line) => {
+    const [assetId, fileName, originalPath, fileCreatedAt, localDateTime, dateTimeOriginal] = line.split('\t');
+    return { assetId, fileName, originalPath, fileCreatedAt, localDateTime, dateTimeOriginal };
+  });
+  utilityRowsCache.set(cacheKey, {
+    rows,
+    expiresAt: Date.now() + utilityRowsCacheTtlMs,
+  });
+  return rows;
+}
+
+function buildUtilityRowsCacheKey(context) {
+  return `${context.nextcloudUserId}:${context.immichUserId}`;
+}
+
+function getUtilityAssetRecord(context, assetId) {
+  const libraryPathCondition = buildLibraryPathSqlCondition(context);
+  const sql = `
+    select
+      a.id,
+      a."originalFileName",
+      a."originalPath",
+      a."fileCreatedAt",
+      a."localDateTime",
+      ae."dateTimeOriginal"
+    from asset a
+    left join asset_exif ae on ae."assetId" = a.id
+    where a.id = ${sqlString(assetId)}
+      and a."ownerId" = ${sqlString(context.immichUserId)}
+      and a."deletedAt" is null
+      and (${libraryPathCondition})
+    limit 1;
+  `;
+  const row = runPostgresQuery(sql);
+  if (!row) {
+    throw httpError(404, `Asset ${assetId} not found`);
+  }
+  const [id, fileName, originalPath, fileCreatedAt, localDateTime, dateTimeOriginal] = row.split('|');
+  return { assetId: id, fileName, originalPath, fileCreatedAt, localDateTime, dateTimeOriginal };
+}
+
+function mapUtilityRowToCandidate(row) {
+  const extension = getFileExtension(row.fileName);
+  if (!SUPPORTED_UTILITY_EXTENSIONS.has(extension)) {
+    return null;
+  }
+
+  const parsed = parseDateFromFilename(row.fileName, row.fileCreatedAt, row.localDateTime);
+  if (!parsed) {
+    return null;
+  }
+
+  const currentDateInfo = normalizeStoredDateTime(row.dateTimeOriginal);
+  const candidateKind = determineCandidateKind(parsed, currentDateInfo);
+  if (!candidateKind) {
+    return null;
+  }
+
+  const parserReason = candidateKind === 'missing'
+    ? parsed.reason
+    : `${parsed.reason} · postojeci datum izgleda sumnjivo`;
+
+  return {
+    assetId: row.assetId,
+    fileName: row.fileName,
+    previewUrl: `/api/assets/${row.assetId}/thumbnail?size=preview`,
+    candidateKind,
+    currentDateTimeIso: currentDateInfo?.iso || null,
+    currentDateTimeLocal: currentDateInfo?.local || 'Nema datuma',
+    proposedDateTimeIso: parsed.iso,
+    proposedDateTimeExif: parsed.exif,
+    proposedDateTimeLocal: parsed.local,
+    parserReason,
+    confidence: parsed.confidence,
+  };
+}
+
+function parseDateFromFilename(fileName, fileCreatedAt, localDateTime) {
+  const baseName = String(fileName || '').replace(/\.[^.]+$/, '');
+  const fallbackTime = extractFallbackTime(fileCreatedAt || localDateTime);
+  const patterns = [
+    {
+      regex: /(?:^|[^0-9])(\d{4})(\d{2})(\d{2})[_ -](\d{2})(\d{2})(\d{2})(?:\d{3})?(?:[^0-9]|$)/,
+      reason: 'Prepoznat obrazac YYYYMMDD_HHMMSS',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])(\d{4})-(\d{2})-(\d{2})[ _. -](\d{2})[.:_-](\d{2})[.:_-](\d{2})(?:[^0-9]|$)/,
+      reason: 'Prepoznat obrazac YYYY-MM-DD HH.MM.SS',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])PXL_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:[^0-9]|$)/i,
+      reason: 'Prepoznat PXL obrazac',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])Screenshot_(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:[^0-9]|$)/i,
+      reason: 'Prepoznat Screenshot obrazac',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])signal-(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})(?:[^0-9]|$)/i,
+      reason: 'Prepoznat Signal obrazac',
+      confidence: 'high',
+    },
+  ];
+
+  for (const pattern of patterns) {
+    const match = baseName.match(pattern.regex);
+    if (!match) {
+      continue;
+    }
+    return buildParsedDateTime(match.slice(1, 7), pattern.reason, pattern.confidence);
+  }
+
+  const whatsappMatch = baseName.match(/(?:IMG|VID)[-_](\d{4})(\d{2})(\d{2})[-_]WA\d+/i);
+  if (whatsappMatch && fallbackTime) {
+    return buildParsedDateTime(
+      [whatsappMatch[1], whatsappMatch[2], whatsappMatch[3], fallbackTime.hour, fallbackTime.minute, fallbackTime.second],
+      'Prepoznat WhatsApp datum, vrijeme preuzeto iz fileCreatedAt',
+      'medium',
+    );
+  }
+
+  const epochMatch = baseName.match(/(?:^|[^0-9])(?:FB_IMG|FACE_SC|PicPlus)_(\d{13})(?:[^0-9]|$)/i);
+  if (epochMatch) {
+    return buildParsedDateTimeFromEpochMilliseconds(
+      epochMatch[1],
+      'Prepoznat epoch timestamp u nazivu datoteke',
+      'high',
+    );
+  }
+
+  return null;
+}
+
+function buildParsedDateTime(parts, reason, confidence) {
+  const [year, month, day, hour, minute, second] = parts.map((value) => String(value).padStart(2, '0'));
+  const local = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+  const iso = `${year}-${month}-${day}T${hour}:${minute}:${second}${resolveTimezoneOffset(year, month, day)}`;
+  const exif = `${year}:${month}:${day} ${hour}:${minute}:${second}`;
+  return { iso, exif, local, date: `${year}-${month}-${day}`, reason, confidence };
+}
+
+function buildParsedDateTimeFromEpochMilliseconds(epochMilliseconds, reason, confidence) {
+  const timestamp = Number(epochMilliseconds);
+  if (!Number.isFinite(timestamp)) {
+    return null;
+  }
+
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: config.utilityTimezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+  const parts = Object.fromEntries(
+    formatter
+      .formatToParts(new Date(timestamp))
+      .filter((item) => item.type !== 'literal')
+      .map((item) => [item.type, item.value]),
+  );
+
+  return buildParsedDateTime(
+    [parts.year, parts.month, parts.day, parts.hour, parts.minute, parts.second],
+    reason,
+    confidence,
+  );
+}
+
+function extractFallbackTime(value) {
+  if (!value) {
+    return null;
+  }
+  const match = String(value).match(/T?(\d{2}):(\d{2}):(\d{2})/);
+  if (!match) {
+    return null;
+  }
+  return { hour: match[1], minute: match[2], second: match[3] };
+}
+
+function normalizeStoredDateTime(value) {
+  if (!value) {
+    return null;
+  }
+  const normalized = String(value).replace('T', ' ');
+  const iso = normalized.includes('T') ? normalized : normalized.replace(' ', 'T');
+  const dateMatch = normalized.match(/^(\d{4}-\d{2}-\d{2})/);
+  return {
+    iso,
+    local: normalized,
+    date: dateMatch ? dateMatch[1] : null,
+  };
+}
+
+function determineCandidateKind(parsed, currentDateInfo) {
+  if (!currentDateInfo?.date) {
+    return 'missing';
+  }
+  return currentDateInfo.date !== parsed.date ? 'mismatch' : null;
+}
+
+function shouldOfferDateCorrection(assetRecord, candidate) {
+  const currentDateInfo = normalizeStoredDateTime(assetRecord.dateTimeOriginal);
+  return determineCandidateKind({
+    date: candidate.proposedDateTimeIso.slice(0, 10),
+  }, currentDateInfo) !== null;
+}
+
+function buildLibraryPathSqlCondition(context) {
+  const libraryPaths = getManagedLibraryPaths(context);
+  return libraryPaths.map((libraryPath) => `a."originalPath" like ${sqlString(`${libraryPath}%`)}`).join(' or ');
+}
+
+function getManagedLibraryPaths(context) {
+  const paths = new Set();
+  if (context.libraryPath) {
+    paths.add(context.libraryPath);
+  }
+  const libraries = context.stateEntry?.libraries && typeof context.stateEntry.libraries === 'object'
+    ? Object.values(context.stateEntry.libraries)
+    : [];
+  for (const library of libraries) {
+    if (library?.libraryPath) {
+      paths.add(library.libraryPath);
+    }
+  }
+  if (paths.size === 0) {
+    throw httpError(400, `Managed user is missing library paths: ${context.nextcloudUserId}`);
+  }
+  return Array.from(paths);
+}
+
+function resolveTimezoneOffset(year, month, day) {
+  const sample = new Date(`${year}-${month}-${day}T12:00:00Z`);
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: config.utilityTimezone,
+    timeZoneName: 'longOffset',
+  });
+  const part = formatter.formatToParts(sample).find((item) => item.type === 'timeZoneName');
+  const offset = part?.value?.replace('GMT', '') || '+00:00';
+  return offset === '' ? '+00:00' : offset;
+}
+
+function applyExifDateTime(originalPath, exifDateTime, extension) {
+  const command = [
+    '-overwrite_original',
+    '-P',
+    `-DateTimeOriginal=${exifDateTime}`,
+    `-CreateDate=${exifDateTime}`,
+    `-ModifyDate=${exifDateTime}`,
+  ];
+
+  if (extension === 'heic' || extension === 'heif') {
+    command.push(`-QuickTime:CreateDate=${exifDateTime}`, `-QuickTime:ModifyDate=${exifDateTime}`);
+  }
+
+  command.push(originalPath);
+
+  try {
+    execFileSync('exiftool', command, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    const output = `${error.stdout || ''}\n${error.stderr || ''}`.trim();
+    throw httpError(500, `EXIF writeback failed: ${output || error.message}`);
+  }
+}
+
+function loadUtilityState() {
+  const state = loadJson(utilityStatePath, { dateFromFilename: { users: {} } });
+  const users = state.dateFromFilename && typeof state.dateFromFilename === 'object' ? state.dateFromFilename.users : {};
+  state.dateFromFilename = {
+    users: users && typeof users === 'object' ? users : {},
+  };
+  return state;
+}
+
+function saveUtilityState(state) {
+  fs.writeFileSync(utilityStatePath, JSON.stringify(state, null, 2));
+}
+
+function ensureUtilityUserState(state, nextcloudUserId) {
+  const users = state.dateFromFilename.users;
+  users[nextcloudUserId] = users[nextcloudUserId] || { applied: {}, skipped: {}, deleted: {}, failed: {} };
+  users[nextcloudUserId].applied = users[nextcloudUserId].applied && typeof users[nextcloudUserId].applied === 'object' ? users[nextcloudUserId].applied : {};
+  users[nextcloudUserId].skipped = users[nextcloudUserId].skipped && typeof users[nextcloudUserId].skipped === 'object' ? users[nextcloudUserId].skipped : {};
+  users[nextcloudUserId].deleted = users[nextcloudUserId].deleted && typeof users[nextcloudUserId].deleted === 'object' ? users[nextcloudUserId].deleted : {};
+  users[nextcloudUserId].failed = users[nextcloudUserId].failed && typeof users[nextcloudUserId].failed === 'object' ? users[nextcloudUserId].failed : {};
+  return users[nextcloudUserId];
+}
+
+async function buildDateFromFilenameResponse(request, options = {}) {
+  const includeCandidate = options.includeCandidate !== false;
+  const context = await createUtilityContextFromRequest(request);
+  const queue = getDateFromFilenameQueue(context, options);
+
+  return {
+    status: {
+      remaining: queue.remaining,
+      total: queue.total,
+      applied: queue.applied,
+      skipped: queue.skipped,
+      deleted: queue.deleted,
+    },
+    candidate: includeCandidate ? queue.candidate : null,
+  };
+}
+
+async function handleDateFromFilenameSkip(request, payload) {
+  const context = await createUtilityContextFromRequest(request);
+  const assetId = requiredString(payload.assetId, 'assetId');
+  const rows = getDateFromFilenameRows(context);
+  const queue = getDateFromFilenameQueue(context, { rows });
+
+  if (!queue.candidate || queue.candidate.assetId !== assetId) {
+    throw httpError(409, 'Asset is no longer the active utility candidate');
+  }
+
+  const state = loadUtilityState();
+  const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+  userState.skipped[assetId] = {
+    decidedAt: new Date().toISOString(),
+    fileName: queue.candidate.fileName,
+    proposedDateTimeIso: queue.candidate.proposedDateTimeIso,
+    parserReason: queue.candidate.parserReason,
+  };
+  saveUtilityState(state);
+
+  writeAuditEntry({
+    kind: 'utility-date-from-filename-skip',
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+    assetId,
+    fileName: queue.candidate.fileName,
+    proposedDateTimeIso: queue.candidate.proposedDateTimeIso,
+    parserReason: queue.candidate.parserReason,
+  });
+
+  return buildDateFromFilenameResponseFromContext(context, { rows, excludeAssetIds: [assetId] });
+}
+
+async function handleDateFromFilenameApply(request, payload) {
+  const context = await createUtilityContextFromRequest(request, { requireAuthenticatedContext: true });
+  const assetId = requiredString(payload.assetId, 'assetId');
+  const rows = getDateFromFilenameRows(context);
+  const queue = getDateFromFilenameQueue(context, { rows });
+
+  if (!queue.candidate || queue.candidate.assetId !== assetId) {
+    throw httpError(409, 'Asset is no longer the active utility candidate');
+  }
+
+  const validation = await validateAssetsOwned(context, [assetId]);
+  const assetRecord = getUtilityAssetRecord(context, assetId);
+  if (!shouldOfferDateCorrection(assetRecord, queue.candidate)) {
+    throw httpError(409, 'Asset no longer requires a date correction');
+  }
+
+  applyExifDateTime(assetRecord.originalPath, queue.candidate.proposedDateTimeExif, getFileExtension(assetRecord.fileName));
+
+  await immichRequest(context.accessToken, 'PUT', '/assets', {
+    ids: [assetId],
+    dateTimeOriginal: queue.candidate.proposedDateTimeIso,
+  });
+
+  const state = loadUtilityState();
+  const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+  userState.applied[assetId] = {
+    decidedAt: new Date().toISOString(),
+    fileName: queue.candidate.fileName,
+    proposedDateTimeIso: queue.candidate.proposedDateTimeIso,
+    parserReason: queue.candidate.parserReason,
+    originalPath: validation.assets[0]?.originalPath || assetRecord.originalPath,
+  };
+  delete userState.skipped[assetId];
+  saveUtilityState(state);
+
+  writeAuditEntry({
+    kind: 'utility-date-from-filename-apply',
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+    assetId,
+    fileName: queue.candidate.fileName,
+    originalPath: assetRecord.originalPath,
+    proposedDateTimeIso: queue.candidate.proposedDateTimeIso,
+    parserReason: queue.candidate.parserReason,
+  });
+
+  return buildDateFromFilenameResponseFromContext(context, { rows, excludeAssetIds: [assetId] });
+}
+
+async function handleDateFromFilenameDelete(request, payload) {
+  const context = await createUtilityContextFromRequest(request, { requireAuthenticatedContext: true });
+  const assetId = requiredString(payload.assetId, 'assetId');
+  const rows = getDateFromFilenameRows(context);
+  const queue = getDateFromFilenameQueue(context, { rows });
+
+  if (!queue.candidate || queue.candidate.assetId !== assetId) {
+    throw httpError(409, 'Asset is no longer the active utility candidate');
+  }
+
+  const validation = await validateAssetsOwned(context, [assetId]);
+  await immichRequest(context.accessToken, 'DELETE', '/assets', {
+    ids: [assetId],
+    force: false,
+  });
+
+  const state = loadUtilityState();
+  const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+  userState.deleted[assetId] = {
+    decidedAt: new Date().toISOString(),
+    fileName: queue.candidate.fileName,
+    originalPath: validation.assets[0]?.originalPath || null,
+    deleteMode: 'trash',
+  };
+  delete userState.skipped[assetId];
+  saveUtilityState(state);
+
+  writeAuditEntry({
+    kind: 'utility-date-from-filename-delete',
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+    assetId,
+    fileName: queue.candidate.fileName,
+    originalPath: validation.assets[0]?.originalPath || null,
+    deleteMode: 'trash',
+  });
+
+  return buildDateFromFilenameResponseFromContext(context, { rows, excludeAssetIds: [assetId] });
+}
+
+function buildDateFromFilenameResponseFromContext(context, options = {}) {
+  const includeCandidate = options.includeCandidate !== false;
+  const queue = getDateFromFilenameQueue(context, options);
+
+  return {
+    status: {
+      remaining: queue.remaining,
+      total: queue.total,
+      applied: queue.applied,
+      skipped: queue.skipped,
+      deleted: queue.deleted,
+    },
+    candidate: includeCandidate ? queue.candidate : null,
+  };
+}
+
+async function createUtilityContextFromRequest(request, options = {}) {
+  const sessionUser = await getImmichSessionUser(request);
+  const baseContext = await createUserContextByImmichUserId(sessionUser.id);
+  if (!options.requireAuthenticatedContext) {
+    return baseContext;
+  }
+
+  return {
+    ...baseContext,
+    accessToken: {
+      sessionCookie: request.headers.cookie,
+    },
+  };
+}
+
+async function getImmichSessionUser(request) {
+  const proxiedUserIdHeader = request.headers['x-immich-user-id'];
+  const proxySecretHeader = request.headers['x-media-ops-proxy-secret'];
+  const proxiedUserId = Array.isArray(proxiedUserIdHeader) ? proxiedUserIdHeader[0] : proxiedUserIdHeader;
+  const proxySecret = Array.isArray(proxySecretHeader) ? proxySecretHeader[0] : proxySecretHeader;
+  if (config.internalEventSecret && proxySecret === config.internalEventSecret && proxiedUserId) {
+    return { id: proxiedUserId };
+  }
+
+  const cookie = request.headers.cookie;
+  if (!cookie) {
+    throw httpError(401, 'Authentication required');
+  }
+
+  const response = await fetch(`${config.immichApiUrl}/users/me`, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+      Cookie: cookie,
+    },
+  });
+
+  const text = await response.text();
+  const data = text ? safeJsonParse(text) : null;
+  if (response.status === 401) {
+    throw httpError(401, 'Authentication required');
+  }
+  if (!response.ok || !data?.id) {
+    throw httpError(403, `Unable to resolve authenticated Immich user: ${text}`);
+  }
+  return data;
+}
+
+function getDateFromFilenameQueue(context, options = {}) {
+  const state = loadUtilityState();
+  const userState = ensureUtilityUserState(state, context.nextcloudUserId);
+  const rows = options.rows || getDateFromFilenameRows(context);
+  const excludedAssetIds = new Set(options.excludeAssetIds || []);
+  const candidates = [];
+
+  for (const row of rows) {
+    const candidate = mapUtilityRowToCandidate(row);
+    if (!candidate) {
+      continue;
+    }
+    if (excludedAssetIds.has(candidate.assetId)) {
+      continue;
+    }
+    if (
+      (userState.applied && userState.applied[candidate.assetId]) ||
+      (userState.skipped && userState.skipped[candidate.assetId]) ||
+      shouldExcludeFailedUtilityCandidate(userState, candidate.assetId)
+    ) {
+      continue;
+    }
+    if (userState.deleted && userState.deleted[candidate.assetId]) {
+      continue;
+    }
+    candidates.push(candidate);
+  }
+
+  return {
+    candidate: candidates[0] || null,
+    remaining: candidates.length,
+    total: rows.length,
+    applied: Object.keys(userState.applied || {}).length,
+    skipped: Object.keys(userState.skipped || {}).length,
+    deleted: Object.keys(userState.deleted || {}).length,
+  };
+}
+
+function getDateFromFilenameRows(context) {
+  const cacheKey = buildUtilityRowsCacheKey(context);
+  const cached = utilityRowsCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.rows;
+  }
+
+  const libraryPathCondition = buildLibraryPathSqlCondition(context);
+  const sql = `
+    select
+      a.id,
+      a."originalFileName",
+      a."originalPath",
+      a."fileCreatedAt",
+      a."localDateTime",
+      ae."dateTimeOriginal"
+    from asset a
+    left join asset_exif ae on ae."assetId" = a.id
+    where a."ownerId" = ${sqlString(context.immichUserId)}
+      and a."deletedAt" is null
+      and a.type = 'IMAGE'
+      and (${libraryPathCondition})
+      and lower(a."originalFileName") ~ '\\.(jpg|jpeg|png|webp|gif|heic|heif)$'
+      and lower(a."originalFileName") ~ '(screenshot_|pxl_|signal-|fb_img_\\d{13}|face_sc_\\d{13}|picplus_\\d{13}|img[-_]\\d{8}-wa|vid[-_]\\d{8}-wa|\\d{8}[_ -]\\d{6}|\\d{4}-\\d{2}-\\d{2}[ _. -]\\d{2}[.:_-]\\d{2}[.:_-]\\d{2})'
+    order by a."fileCreatedAt" asc, a.id asc;
+  `;
+
+  const rows = runPostgresRowsQuery(sql).map((line) => {
+    const [assetId, fileName, originalPath, fileCreatedAt, localDateTime, dateTimeOriginal] = line.split('\t');
+    return { assetId, fileName, originalPath, fileCreatedAt, localDateTime, dateTimeOriginal };
+  });
+  utilityRowsCache.set(cacheKey, {
+    rows,
+    expiresAt: Date.now() + utilityRowsCacheTtlMs,
+  });
+  return rows;
+}
+
+function getUtilityAssetRecord(context, assetId) {
+  const libraryPathCondition = buildLibraryPathSqlCondition(context);
+  const sql = `
+    select
+      a.id,
+      a."originalFileName",
+      a."originalPath",
+      a."fileCreatedAt",
+      a."localDateTime",
+      ae."dateTimeOriginal"
+    from asset a
+    left join asset_exif ae on ae."assetId" = a.id
+    where a.id = ${sqlString(assetId)}
+      and a."ownerId" = ${sqlString(context.immichUserId)}
+      and a."deletedAt" is null
+      and (${libraryPathCondition})
+    limit 1;
+  `;
+  const row = runPostgresQuery(sql);
+  if (!row) {
+    throw httpError(404, `Asset ${assetId} not found`);
+  }
+  const [id, fileName, originalPath, fileCreatedAt, localDateTime, dateTimeOriginal] = row.split('|');
+  return { assetId: id, fileName, originalPath, fileCreatedAt, localDateTime, dateTimeOriginal };
+}
+
+function mapUtilityRowToCandidate(row) {
+  const extension = getFileExtension(row.fileName);
+  if (!SUPPORTED_UTILITY_EXTENSIONS.has(extension)) {
+    return null;
+  }
+
+  const parsed = parseDateFromFilename(row.fileName, row.fileCreatedAt, row.localDateTime);
+  if (!parsed) {
+    return null;
+  }
+
+  const currentDateInfo = normalizeStoredDateTime(row.dateTimeOriginal);
+  const candidateKind = determineCandidateKind(parsed, currentDateInfo);
+  if (!candidateKind) {
+    return null;
+  }
+
+  const parserReason = candidateKind === 'missing'
+    ? parsed.reason
+    : `${parsed.reason} · postojeci datum izgleda sumnjivo`;
+
+  return {
+    assetId: row.assetId,
+    fileName: row.fileName,
+    previewUrl: `/api/assets/${row.assetId}/thumbnail?size=preview`,
+    candidateKind,
+    currentDateTimeIso: currentDateInfo?.iso || null,
+    currentDateTimeLocal: currentDateInfo?.local || 'Nema datuma',
+    proposedDateTimeIso: parsed.iso,
+    proposedDateTimeExif: parsed.exif,
+    proposedDateTimeLocal: parsed.local,
+    parserReason,
+    confidence: parsed.confidence,
+  };
+}
+
+function parseDateFromFilename(fileName, fileCreatedAt, localDateTime) {
+  const baseName = String(fileName || '').replace(/\.[^.]+$/, '');
+  const fallbackTime = extractFallbackTime(fileCreatedAt || localDateTime);
+  const patterns = [
+    {
+      regex: /(?:^|[^0-9])(\d{4})(\d{2})(\d{2})[_ -](\d{2})(\d{2})(\d{2})(?:[^0-9]|$)/,
+      reason: 'Prepoznat obrazac YYYYMMDD_HHMMSS',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])(\d{4})-(\d{2})-(\d{2})[ _. -](\d{2})[.:_-](\d{2})[.:_-](\d{2})(?:[^0-9]|$)/,
+      reason: 'Prepoznat obrazac YYYY-MM-DD HH.MM.SS',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])PXL_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:[^0-9]|$)/i,
+      reason: 'Prepoznat PXL obrazac',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])Screenshot_(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:[^0-9]|$)/i,
+      reason: 'Prepoznat Screenshot obrazac',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])signal-(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})(\d{2})(?:[^0-9]|$)/i,
+      reason: 'Prepoznat Signal obrazac',
+      confidence: 'high',
+    },
+  ];
+
+  for (const pattern of patterns) {
+    const match = baseName.match(pattern.regex);
+    if (!match) {
+      continue;
+    }
+    return buildParsedDateTime(match.slice(1, 7), pattern.reason, pattern.confidence);
+  }
+
+  const whatsappMatch = baseName.match(/(?:IMG|VID)[-_](\d{4})(\d{2})(\d{2})[-_]WA\d+/i);
+  if (whatsappMatch && fallbackTime) {
+    return buildParsedDateTime(
+      [whatsappMatch[1], whatsappMatch[2], whatsappMatch[3], fallbackTime.hour, fallbackTime.minute, fallbackTime.second],
+      'Prepoznat WhatsApp datum, vrijeme preuzeto iz fileCreatedAt',
+      'medium',
+    );
+  }
+
+  const epochMatch = baseName.match(/(?:^|[^0-9])(?:FB_IMG|FACE_SC|PicPlus)_(\d{13})(?:[^0-9]|$)/i);
+  if (epochMatch) {
+    return buildParsedDateTimeFromEpochMilliseconds(
+      epochMatch[1],
+      'Prepoznat epoch timestamp u nazivu datoteke',
+      'high',
+    );
+  }
+
+  return null;
+}
+
+function buildParsedDateTime(parts, reason, confidence) {
+  const [year, month, day, hour, minute, second] = parts.map((value) => String(value).padStart(2, '0'));
+  const local = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+  const iso = `${year}-${month}-${day}T${hour}:${minute}:${second}${resolveTimezoneOffset(year, month, day)}`;
+  const exif = `${year}:${month}:${day} ${hour}:${minute}:${second}`;
+  return { iso, exif, local, date: `${year}-${month}-${day}`, reason, confidence };
+}
+
+function extractFallbackTime(value) {
+  if (!value) {
+    return null;
+  }
+  const match = String(value).match(/T?(\d{2}):(\d{2}):(\d{2})/);
+  if (!match) {
+    return null;
+  }
+  return { hour: match[1], minute: match[2], second: match[3] };
+}
+
+function normalizeStoredDateTime(value) {
+  if (!value) {
+    return null;
+  }
+  const normalized = String(value).replace('T', ' ');
+  const iso = normalized.includes('T') ? normalized : normalized.replace(' ', 'T');
+  const dateMatch = normalized.match(/^(\d{4}-\d{2}-\d{2})/);
+  return {
+    iso,
+    local: normalized,
+    date: dateMatch ? dateMatch[1] : null,
+  };
+}
+
+function determineCandidateKind(parsed, currentDateInfo) {
+  if (!currentDateInfo?.date) {
+    return 'missing';
+  }
+  return currentDateInfo.date !== parsed.date ? 'mismatch' : null;
+}
+
+function shouldOfferDateCorrection(assetRecord, candidate) {
+  const currentDateInfo = normalizeStoredDateTime(assetRecord.dateTimeOriginal);
+  return determineCandidateKind({
+    date: candidate.proposedDateTimeIso.slice(0, 10),
+  }, currentDateInfo) !== null;
+}
+
+function buildLibraryPathSqlCondition(context) {
+  const libraryPaths = getManagedLibraryPaths(context);
+  return libraryPaths.map((libraryPath) => `a."originalPath" like ${sqlString(`${libraryPath}%`)}`).join(' or ');
+}
+
+function getManagedLibraryPaths(context) {
+  const paths = new Set();
+  if (context.libraryPath) {
+    paths.add(context.libraryPath);
+  }
+  const libraries = context.stateEntry?.libraries && typeof context.stateEntry.libraries === 'object'
+    ? Object.values(context.stateEntry.libraries)
+    : [];
+  for (const library of libraries) {
+    if (library?.libraryPath) {
+      paths.add(library.libraryPath);
+    }
+  }
+  if (paths.size === 0) {
+    throw httpError(400, `Managed user is missing library paths: ${context.nextcloudUserId}`);
+  }
+  return Array.from(paths);
+}
+
+function resolveTimezoneOffset(year, month, day) {
+  const sample = new Date(`${year}-${month}-${day}T12:00:00Z`);
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: config.utilityTimezone,
+    timeZoneName: 'longOffset',
+  });
+  const part = formatter.formatToParts(sample).find((item) => item.type === 'timeZoneName');
+  const offset = part?.value?.replace('GMT', '') || '+00:00';
+  return offset === '' ? '+00:00' : offset;
+}
+
+function applyExifDateTime(originalPath, exifDateTime, extension) {
+  const command = [
+    '-overwrite_original',
+    '-P',
+    `-DateTimeOriginal=${exifDateTime}`,
+    `-CreateDate=${exifDateTime}`,
+    `-ModifyDate=${exifDateTime}`,
+  ];
+
+  if (extension === 'heic' || extension === 'heif') {
+    command.push(`-QuickTime:CreateDate=${exifDateTime}`, `-QuickTime:ModifyDate=${exifDateTime}`);
+  }
+
+  command.push(originalPath);
+
+  try {
+    execFileSync('exiftool', command, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    const output = `${error.stdout || ''}\n${error.stderr || ''}`.trim();
+    throw httpError(500, `EXIF writeback failed: ${output || error.message}`);
+  }
+}
+
+function loadUtilityState() {
+  const state = loadJson(utilityStatePath, { dateFromFilename: { users: {} } });
+  const users = state.dateFromFilename && typeof state.dateFromFilename === 'object' ? state.dateFromFilename.users : {};
+  state.dateFromFilename = {
+    users: users && typeof users === 'object' ? users : {},
+  };
+  return state;
+}
+
+function saveUtilityState(state) {
+  fs.writeFileSync(utilityStatePath, JSON.stringify(state, null, 2));
+}
+
+function ensureUtilityUserState(state, nextcloudUserId) {
+  const users = state.dateFromFilename.users;
+  users[nextcloudUserId] = users[nextcloudUserId] || { applied: {}, skipped: {}, deleted: {}, failed: {} };
+  users[nextcloudUserId].applied = users[nextcloudUserId].applied && typeof users[nextcloudUserId].applied === 'object' ? users[nextcloudUserId].applied : {};
+  users[nextcloudUserId].skipped = users[nextcloudUserId].skipped && typeof users[nextcloudUserId].skipped === 'object' ? users[nextcloudUserId].skipped : {};
+  users[nextcloudUserId].deleted = users[nextcloudUserId].deleted && typeof users[nextcloudUserId].deleted === 'object' ? users[nextcloudUserId].deleted : {};
+  users[nextcloudUserId].failed = users[nextcloudUserId].failed && typeof users[nextcloudUserId].failed === 'object' ? users[nextcloudUserId].failed : {};
+  return users[nextcloudUserId];
 }
 
 async function handleInternalImmichEvent(payload) {
@@ -154,7 +1612,7 @@ async function handleInternalImmichEvent(payload) {
   };
 
   writeAuditEntry({
-    kind: 'immich-trash-event-received',
+    kind: 'immich-event-received',
     ...eventRecord,
   });
 
@@ -188,6 +1646,7 @@ async function dispatchOperation(payload) {
     'trash-assets': handleTrashAssets,
     'confirm-delete-assets': handleConfirmDeleteAssets,
     'move-assets-to-folder': handleMoveAssetsToFolder,
+    'reconcile-smart-albums': handleReconcileSmartAlbums,
   };
 
   const handler = handlers[operation];
@@ -511,6 +1970,29 @@ async function handleMoveAssetsToFolder(payload) {
   });
 }
 
+async function handleReconcileSmartAlbums(payload) {
+  if (!config.smartAlbumsEnabled) {
+    throw new Error('MEDIA_OPS_SMART_ALBUMS_ENABLED=false');
+  }
+
+  const context = await createUserContext(payload.nextcloudUserId);
+  const assetIds = requiredStringArray(payload.assetIds, 'assetIds');
+  const runtime = createSmartAlbumRuntime();
+  const results = [];
+
+  for (const assetId of assetIds) {
+    results.push(await reconcileSmartAlbumsForAsset(context, runtime, assetId, null));
+  }
+
+  return finalizeResult('reconcile-smart-albums', payload, context, {
+    assetIds,
+    smartAlbumsDryRun: config.smartAlbumsDryRun,
+    smartAlbumsEnabled: config.smartAlbumsEnabled,
+    status: summarizePerAssetStatus(results),
+    assets: results,
+  });
+}
+
 async function createUserContext(nextcloudUserId) {
   const managedState = loadJson(managedStatePath, { users: {} });
   const credentials = loadJson(credentialsPath, {});
@@ -548,6 +2030,18 @@ async function createUserContextByImmichUserId(immichUserId) {
   }
 
   return createManagedContext(users[managedEmail].nextcloudUserId || managedEmail, users[managedEmail]);
+}
+
+async function createAuthenticatedUserContextByImmichUserId(immichUserId) {
+  const managedState = loadJson(managedStatePath, { users: {} });
+  const users = managedState.users && typeof managedState.users === 'object' ? managedState.users : {};
+  const managedEmail = Object.keys(users).find((candidate) => users[candidate]?.immichUserId === immichUserId);
+
+  if (!managedEmail) {
+    throw new Error(`Unknown managed Immich user: ${immichUserId}`);
+  }
+
+  return createUserContext(users[managedEmail].nextcloudUserId || managedEmail);
 }
 
 function createManagedContext(nextcloudUserId, stateEntry) {
@@ -629,8 +2123,9 @@ async function processImmichEvent(eventRecord) {
   const isTrashEvent = eventRecord.eventType === 'AssetTrashAll';
   const isRestoreEvent = eventRecord.eventType === 'AssetRestoreAll';
   const isDeleteEvent = eventRecord.eventType === 'AssetDeleteAll';
+  const isSmartAlbumEvent = ['AssetMetadataExtracted', 'AssetFacesRecognized'].includes(eventRecord.eventType);
 
-  if (!isTrashEvent && !isRestoreEvent && !isDeleteEvent) {
+  if (!isTrashEvent && !isRestoreEvent && !isDeleteEvent && !isSmartAlbumEvent) {
     const result = {
       eventId: eventRecord.id,
       status: 'ignored',
@@ -644,6 +2139,10 @@ async function processImmichEvent(eventRecord) {
       reason: result.reason,
     });
     return result;
+  }
+
+  if (isSmartAlbumEvent) {
+    return processSmartAlbumEvent(eventRecord);
   }
 
   if (isTrashEvent && !config.nextcloudTrashSyncEnabled) {
@@ -719,6 +2218,51 @@ async function processImmichEvent(eventRecord) {
     eventId: eventRecord.id,
     status: results.some((item) => item.status === 'error') ? 'partial_failure' : 'success',
     nextcloudUserId: context.nextcloudUserId,
+    assets: results,
+  };
+}
+
+async function processSmartAlbumEvent(eventRecord) {
+  if (!config.smartAlbumsEnabled) {
+    return {
+      eventId: eventRecord.id,
+      status: 'disabled',
+      reason: 'MEDIA_OPS_SMART_ALBUMS_ENABLED=false',
+      assets: [],
+    };
+  }
+
+  const context = await createAuthenticatedUserContextByImmichUserId(eventRecord.userId);
+  const runtime = createSmartAlbumRuntime();
+  const results = [];
+
+  for (const assetId of eventRecord.assetIds) {
+    try {
+      results.push(await reconcileSmartAlbumsForAsset(context, runtime, assetId, eventRecord));
+    } catch (error) {
+      const failure = {
+        assetId,
+        status: 'error',
+        message: String(error.message || error),
+      };
+      results.push(failure);
+      writeAuditEntry({
+        kind: 'smart-album-error',
+        eventId: eventRecord.id,
+        eventType: eventRecord.eventType,
+        assetId,
+        nextcloudUserId: context.nextcloudUserId,
+        message: failure.message,
+      });
+    }
+  }
+
+  return {
+    eventId: eventRecord.id,
+    eventType: eventRecord.eventType,
+    nextcloudUserId: context.nextcloudUserId,
+    smartAlbumsDryRun: config.smartAlbumsDryRun,
+    status: summarizePerAssetStatus(results),
     assets: results,
   };
 }
@@ -1089,6 +2633,275 @@ function buildUserDestinationPath(context, destinationRelative) {
   return destinationPath;
 }
 
+function createSmartAlbumRuntime() {
+  return {
+    albumsByName: new Map(),
+  };
+}
+
+async function reconcileSmartAlbumsForAsset(context, runtime, assetId, eventRecord) {
+  const asset = await lookupAssetForEvent(assetId);
+  const originalPath = asset.originalPath || null;
+
+  if (!originalPath || asset.ownerId !== context.immichUserId) {
+    const skipped = {
+      assetId,
+      eventType: eventRecord?.eventType || null,
+      status: 'skipped_unmanaged',
+      originalPath,
+    };
+    writeAuditEntry({
+      kind: 'smart-album-skipped',
+      eventId: eventRecord?.id || null,
+      eventType: eventRecord?.eventType || null,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      reason: 'unmanaged_or_missing_path',
+      originalPath,
+    });
+    return skipped;
+  }
+
+  if (asset.isTrashed) {
+    const skipped = {
+      assetId,
+      eventType: eventRecord?.eventType || null,
+      status: 'skipped_trashed',
+      originalPath,
+    };
+    writeAuditEntry({
+      kind: 'smart-album-skipped',
+      eventId: eventRecord?.id || null,
+      eventType: eventRecord?.eventType || null,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      reason: 'asset_trashed',
+      originalPath,
+    });
+    return skipped;
+  }
+
+  const fileName = path.posix.basename(originalPath);
+  const faceCount = lookupAssetFaceCount(assetId);
+  const desiredAlbumNames = classifySmartAlbums({ faceCount, fileName }).map((album) => album.name);
+  const existingMemberships = lookupManagedSmartAlbumMemberships(context.immichUserId, assetId);
+  const existingAlbumNames = new Set(existingMemberships.map((album) => album.albumName));
+  const desiredAlbumNameSet = new Set(desiredAlbumNames);
+  const additions = desiredAlbumNames.filter((albumName) => !existingAlbumNames.has(albumName));
+  const removals = existingMemberships.filter((album) => !desiredAlbumNameSet.has(album.albumName));
+  const createdAlbums = [];
+  const plannedAlbumCreates = [];
+
+  for (const albumName of additions) {
+    const albumRef = await ensureManagedSmartAlbum(context, runtime, albumName, assetId);
+    if (albumRef.created) {
+      createdAlbums.push(albumName);
+    }
+    if (albumRef.plannedCreate) {
+      plannedAlbumCreates.push(albumName);
+    }
+    if (config.smartAlbumsDryRun || !albumRef.id) {
+      continue;
+    }
+    await immichRequest(context.accessToken, 'PUT', `/albums/${albumRef.id}/assets`, { ids: [assetId] });
+    writeAuditEntry({
+      kind: 'smart-album-membership-added',
+      eventId: eventRecord?.id || null,
+      eventType: eventRecord?.eventType || null,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      albumId: albumRef.id,
+      albumName,
+      originalPath,
+    });
+  }
+
+  for (const album of removals) {
+    if (!config.smartAlbumsDryRun) {
+      await immichRequest(context.accessToken, 'DELETE', `/albums/${album.id}/assets`, { ids: [assetId] });
+    }
+    writeAuditEntry({
+      kind: config.smartAlbumsDryRun ? 'smart-album-membership-remove-planned' : 'smart-album-membership-removed',
+      eventId: eventRecord?.id || null,
+      eventType: eventRecord?.eventType || null,
+      assetId,
+      nextcloudUserId: context.nextcloudUserId,
+      albumId: album.id,
+      albumName: album.albumName,
+      originalPath,
+    });
+  }
+
+  writeAuditEntry({
+    kind: config.smartAlbumsDryRun ? 'smart-album-reconcile-planned' : 'smart-album-reconciled',
+    eventId: eventRecord?.id || null,
+    eventType: eventRecord?.eventType || null,
+    assetId,
+    nextcloudUserId: context.nextcloudUserId,
+    originalPath,
+    fileName,
+    faceCount,
+    desiredAlbumNames,
+    existingAlbumNames: existingMemberships.map((album) => album.albumName),
+    additions,
+    removals: removals.map((album) => album.albumName),
+    createdAlbums,
+    plannedAlbumCreates,
+  });
+
+  return {
+    assetId,
+    eventType: eventRecord?.eventType || null,
+    status:
+      additions.length === 0 && removals.length === 0 && createdAlbums.length === 0
+        ? 'unchanged'
+        : config.smartAlbumsDryRun
+          ? 'planned'
+          : 'applied',
+    originalPath,
+    fileName,
+    faceCount,
+    desiredAlbumNames,
+    existingAlbumNames: existingMemberships.map((album) => album.albumName),
+    additions,
+    removals: removals.map((album) => album.albumName),
+    createdAlbums,
+    plannedAlbumCreates,
+    smartAlbumsDryRun: config.smartAlbumsDryRun,
+  };
+}
+
+function classifySmartAlbums(input) {
+  return SMART_ALBUM_DEFINITIONS.filter((definition) => definition.matcher(input));
+}
+
+async function ensureManagedSmartAlbum(context, runtime, albumName, seedAssetId) {
+  const cached = runtime.albumsByName.get(albumName);
+  if (cached) {
+    return { ...cached, created: false, plannedCreate: false };
+  }
+
+  const existing = lookupOwnedAlbumByName(context.immichUserId, albumName);
+  if (existing) {
+    runtime.albumsByName.set(albumName, existing);
+    return existing;
+  }
+
+  if (config.smartAlbumsDryRun) {
+    const planned = { id: null, albumName, created: false, plannedCreate: true };
+    runtime.albumsByName.set(albumName, { id: null, albumName, created: false, plannedCreate: false });
+    writeAuditEntry({
+      kind: 'smart-album-create-planned',
+      nextcloudUserId: context.nextcloudUserId,
+      albumName,
+      seedAssetId,
+    });
+    return planned;
+  }
+
+  const created = await immichRequest(context.accessToken, 'POST', '/albums', {
+    albumName,
+    assetIds: [],
+  });
+  const createdAlbum = {
+    id: created.id,
+    albumName,
+    created: true,
+  };
+  runtime.albumsByName.set(albumName, { id: created.id, albumName, created: false, plannedCreate: false });
+  writeAuditEntry({
+    kind: 'smart-album-created',
+    nextcloudUserId: context.nextcloudUserId,
+    albumId: created.id,
+    albumName,
+    seedAssetId,
+  });
+  return createdAlbum;
+}
+
+function lookupAssetFaceCount(assetId) {
+  const row = runPostgresQuery(
+    `select count(*) from asset_face where "assetId" = ${sqlString(assetId)} and "deletedAt" is null and "isVisible" is true;`,
+  );
+  return Number.parseInt(row || '0', 10) || 0;
+}
+
+function lookupManagedSmartAlbumMemberships(ownerId, assetId) {
+  const rows = runPostgresRowsQuery(`
+    select album.id, album."albumName"
+    from album
+    join album_asset on album_asset."albumId" = album.id
+    where album."ownerId" = ${sqlString(ownerId)}
+      and album_asset."assetId" = ${sqlString(assetId)}
+      and album."deletedAt" is null
+      and album."albumName" in (${sqlStringList(getManagedSmartAlbumNames())});
+  `);
+
+  return rows.map((line) => {
+    const [id, albumName] = line.split('\t');
+    return { id, albumName };
+  });
+}
+
+function lookupOwnedAlbumByName(ownerId, albumName) {
+  const row = runPostgresQuery(`
+    select id || E'\\t' || "albumName"
+    from album
+    where "ownerId" = ${sqlString(ownerId)}
+      and "albumName" = ${sqlString(albumName)}
+      and "deletedAt" is null
+    order by "createdAt" desc
+    limit 1;
+  `);
+
+  if (!row) {
+    return null;
+  }
+
+  const [id, resolvedAlbumName] = row.split('\t');
+  return { id, albumName: resolvedAlbumName, created: false };
+}
+
+function getManagedSmartAlbumNames() {
+  return SMART_ALBUM_DEFINITIONS.map((definition) => definition.name);
+}
+
+function summarizePerAssetStatus(results) {
+  if (results.some((item) => item.status === 'error')) {
+    return 'partial_failure';
+  }
+  if (results.some((item) => item.status === 'applied')) {
+    return 'success';
+  }
+  if (results.some((item) => item.status === 'planned')) {
+    return 'planned';
+  }
+  return 'success';
+}
+
+function isScreenshotCandidate(fileName) {
+  const value = String(fileName || '').toLowerCase();
+  return /(screenshot|screen shot|screen[_ -]?shot)/i.test(value);
+}
+
+function isWhatsAppCandidate(fileName) {
+  const value = String(fileName || '').toLowerCase();
+  return (
+    /^img-\d{8}-wa\d+\.(jpe?g|png|heic|webp)$/i.test(value) ||
+    /^vid-\d{8}-wa\d+\.(mp4|mov|3gp)$/i.test(value) ||
+    /^whatsapp image \d{4}-\d{2}-\d{2} at .+\.(jpe?g|png|heic|webp)$/i.test(value) ||
+    /^whatsapp video \d{4}-\d{2}-\d{2} at .+\.(mp4|mov|3gp)$/i.test(value)
+  );
+}
+
+function isDocumentCandidate(fileName) {
+  const value = String(fileName || '').toLowerCase();
+  if (!/\.(jpe?g)$/.test(value)) {
+    return false;
+  }
+  return /(^|[^a-z])(scan|document|doc|receipt|invoice)([^a-z]|$)/.test(value);
+}
+
 async function syncNextcloudAlbumWriteback(context, albumName, assetIds = [], validation = null) {
   if (!config.nextcloudAlbumWritebackEnabled) {
     return {
@@ -1450,9 +3263,45 @@ function runPostgresQuery(sql) {
       sql,
     ], {
       encoding: 'utf8',
+      maxBuffer: 20 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     return stdout.trim() || null;
+  } catch (error) {
+    const output = sanitizeOccOutput(`${error.stdout || ''}\n${error.stderr || ''}`);
+    throw new Error(`Postgres lookup failed: ${output || error.message}`);
+  }
+}
+
+function runPostgresRowsQuery(sql) {
+  if (!config.dbPassword) {
+    throw new Error('DB_PASSWORD is required for Postgres queries');
+  }
+
+  try {
+    const stdout = execFileSync('docker', [
+      'exec',
+      '-e',
+      `PGPASSWORD=${config.dbPassword}`,
+      config.dbHostname,
+      'psql',
+      '-U',
+      config.dbUsername,
+      '-d',
+      config.dbDatabaseName,
+      '-F',
+      '\t',
+      '-Atc',
+      sql,
+    ], {
+      encoding: 'utf8',
+      maxBuffer: 20 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
   } catch (error) {
     const output = sanitizeOccOutput(`${error.stdout || ''}\n${error.stderr || ''}`);
     throw new Error(`Postgres lookup failed: ${output || error.message}`);
@@ -1475,6 +3324,14 @@ function sanitizeOccOutput(rawOutput) {
     })
     .join('\n')
     .trim();
+}
+
+function sqlString(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function sqlStringList(values) {
+  return values.map((value) => sqlString(value)).join(', ');
 }
 
 function resolveAlbumName(album, albumId) {
@@ -1601,12 +3458,21 @@ async function loginImmichUser(email, password) {
 }
 
 async function immichRequest(accessToken, method, pathname, body) {
+  const authHeaders = {};
+  if (typeof accessToken === 'string' && accessToken) {
+    authHeaders.Authorization = `Bearer ${accessToken}`;
+  } else if (accessToken && typeof accessToken === 'object' && accessToken.sessionCookie) {
+    authHeaders.Cookie = accessToken.sessionCookie;
+  } else {
+    throw new Error(`Missing authentication for ${method} ${pathname}`);
+  }
+
   const response = await fetch(`${config.immichApiUrl}${pathname}`, {
     method,
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${accessToken}`,
+      ...authHeaders,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -1714,10 +3580,27 @@ function verifyInternalEventRequest(request) {
   }
 }
 
+function verifyUtilityMutationRequest(request) {
+  const origin = request.headers.origin;
+  if (origin && origin !== 'https://media.finestar.hr') {
+    throw httpError(403, 'Unauthorized origin');
+  }
+}
+
 function respondJson(response, statusCode, body) {
   response.statusCode = statusCode;
   response.setHeader('Content-Type', 'application/json');
+  response.setHeader('Connection', 'close');
+  response.shouldKeepAlive = false;
   response.end(JSON.stringify(body));
+}
+
+function respondHtml(response, statusCode, body) {
+  response.statusCode = statusCode;
+  response.setHeader('Content-Type', 'text/html; charset=utf-8');
+  response.setHeader('Connection', 'close');
+  response.shouldKeepAlive = false;
+  response.end(body);
 }
 
 function writeAuditEntry(entry) {
@@ -1738,6 +3621,12 @@ function sanitizePayload(payload) {
 
 function compactObject(object) {
   return Object.fromEntries(Object.entries(object).filter(([, value]) => value !== undefined));
+}
+
+function httpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
 }
 
 function requiredString(value, name) {
@@ -1787,6 +3676,10 @@ function parseBoolean(value) {
 function parseInteger(value, fallback) {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getFileExtension(fileName) {
+  return String(fileName || '').split('.').pop().toLowerCase();
 }
 
 function env(name, fallback) {

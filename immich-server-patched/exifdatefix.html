@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="hr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EXIF Date Fix</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f1e7;
+        --panel: rgba(255, 252, 245, 0.92);
+        --line: rgba(25, 46, 72, 0.12);
+        --text: #17304b;
+        --muted: #5f7184;
+        --accent: #c3562a;
+        --accent-dark: #8f3f1c;
+        --shadow: 0 20px 50px rgba(23, 48, 75, 0.12);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Georgia, "Times New Roman", serif;
+        background:
+          radial-gradient(circle at top left, rgba(195, 86, 42, 0.18), transparent 28%),
+          radial-gradient(circle at right center, rgba(23, 48, 75, 0.12), transparent 24%),
+          linear-gradient(180deg, #f7f3ea 0%, var(--bg) 100%);
+        color: var(--text);
+        min-height: 100vh;
+      }
+      .shell {
+        width: min(1100px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 32px 0 48px;
+      }
+      .hero { margin-bottom: 22px; }
+      .eyebrow {
+        margin: 0 0 8px;
+        font-size: 12px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--accent);
+      }
+      h1 {
+        margin: 0;
+        font-size: clamp(34px, 6vw, 62px);
+        line-height: 0.95;
+        max-width: 10ch;
+      }
+      .lead {
+        max-width: 70ch;
+        color: var(--muted);
+        font-size: 18px;
+        line-height: 1.6;
+      }
+      .panel {
+        display: grid;
+        grid-template-columns: 1.2fr 0.8fr;
+        gap: 24px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+      .preview {
+        min-height: 68vh;
+        background: linear-gradient(160deg, rgba(23, 48, 75, 0.04), rgba(195, 86, 42, 0.08));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 18px;
+      }
+      .preview img {
+        width: 100%;
+        max-height: calc(68vh - 36px);
+        object-fit: contain;
+        border-radius: 20px;
+        background: rgba(255, 255, 255, 0.72);
+      }
+      .details {
+        padding: 28px 28px 24px;
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+      .card {
+        padding: 16px 18px;
+        border-radius: 18px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.66);
+      }
+      .label {
+        display: block;
+        font-size: 12px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin-bottom: 8px;
+      }
+      .value {
+        font-size: 17px;
+        line-height: 1.5;
+        word-break: break-word;
+      }
+      .date-value {
+        font-size: 26px;
+        line-height: 1.15;
+      }
+      .muted { color: var(--muted); }
+      .actions {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      button {
+        appearance: none;
+        border: 0;
+        border-radius: 999px;
+        padding: 14px 20px;
+        font: inherit;
+        cursor: pointer;
+        transition: transform 120ms ease, opacity 120ms ease, background 120ms ease;
+      }
+      button:hover:enabled { transform: translateY(-1px); }
+      button:disabled {
+        opacity: 0.45;
+        cursor: wait;
+      }
+      .btn-primary {
+        background: var(--accent);
+        color: #fff8f3;
+      }
+      .btn-primary:hover:enabled { background: var(--accent-dark); }
+      .btn-secondary {
+        background: rgba(23, 48, 75, 0.08);
+        color: var(--text);
+      }
+      .btn-danger {
+        background: #8e2f24;
+        color: #fff7f4;
+      }
+      .btn-danger:hover:enabled { background: #6e2119; }
+      .status {
+        min-height: 24px;
+        color: var(--accent-dark);
+        font-size: 15px;
+      }
+      .empty {
+        text-align: center;
+        padding: 80px 24px;
+      }
+      .empty h2 { margin-bottom: 8px; }
+      @media (max-width: 880px) {
+        .panel { grid-template-columns: 1fr; }
+        .preview { min-height: 44vh; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Immich Utility</p>
+        <h1>EXIF Date Fix</h1>
+        <p class="lead">
+          Ovaj utility pronalazi fotografije kojima nedostaje EXIF datum ili imaju sumnjiv datum,
+          predlaze ispravan datum iz naziva datoteke i dopusta da ga potvrdis ili preskocis bez promjene.
+        </p>
+      </section>
+
+      <section class="panel" id="appPanel" hidden>
+        <div class="preview">
+          <img id="assetPreview" alt="Pregled asseta" />
+        </div>
+        <div class="details">
+          <div class="card">
+            <span class="label">Datoteka</span>
+            <div class="value" id="fileName">-</div>
+          </div>
+          <div class="card">
+            <span class="label">Trenutni datum</span>
+            <div class="value" id="currentDate">-</div>
+          </div>
+          <div class="card">
+            <span class="label">Predlozeni datum</span>
+            <div class="date-value" id="proposedDate">-</div>
+            <div class="muted" id="proposedReason"></div>
+          </div>
+          <div class="card">
+            <span class="label">Status reda</span>
+            <div class="value" id="queueStatus">-</div>
+          </div>
+          <div class="actions">
+            <button class="btn-primary" id="applyButton">Postavi datum</button>
+            <button class="btn-secondary" id="skipButton">Next</button>
+            <button class="btn-danger" id="deleteButton">Delete</button>
+            <button class="btn-secondary" id="backgroundApplyButton">Obradi Sve</button>
+          </div>
+          <div class="status" id="statusMessage"></div>
+        </div>
+      </section>
+
+      <section class="panel empty" id="emptyPanel" hidden>
+        <div style="grid-column: 1 / -1;">
+          <h2>Nema vise kandidata</h2>
+          <p class="muted">
+            Trenutno nema fotografija koje ovaj utility moze pouzdano procijeniti iz naziva datoteke.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const state = { candidate: null, busy: false };
+      const elements = {
+        appPanel: document.getElementById('appPanel'),
+        emptyPanel: document.getElementById('emptyPanel'),
+        assetPreview: document.getElementById('assetPreview'),
+        fileName: document.getElementById('fileName'),
+        currentDate: document.getElementById('currentDate'),
+        proposedDate: document.getElementById('proposedDate'),
+        proposedReason: document.getElementById('proposedReason'),
+        queueStatus: document.getElementById('queueStatus'),
+        applyButton: document.getElementById('applyButton'),
+        skipButton: document.getElementById('skipButton'),
+        deleteButton: document.getElementById('deleteButton'),
+        backgroundApplyButton: document.getElementById('backgroundApplyButton'),
+        statusMessage: document.getElementById('statusMessage'),
+      };
+
+      async function request(path, options = {}) {
+        const response = await fetch(path, {
+          ...options,
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(options.headers || {}),
+          },
+        });
+
+        if (response.status === 401) {
+          window.location.href = '/auth/login';
+          return null;
+        }
+
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.message || 'Utility request failed');
+        }
+        return payload;
+      }
+
+      function setBusy(isBusy) {
+        state.busy = isBusy;
+        elements.applyButton.disabled = isBusy;
+        elements.skipButton.disabled = isBusy;
+        elements.deleteButton.disabled = isBusy;
+        elements.backgroundApplyButton.disabled = isBusy;
+      }
+
+      function render(payload) {
+        const candidate = payload?.candidate || null;
+        state.candidate = candidate;
+
+        if (!candidate) {
+          elements.appPanel.hidden = true;
+          elements.emptyPanel.hidden = false;
+          return;
+        }
+
+        elements.emptyPanel.hidden = true;
+        elements.appPanel.hidden = false;
+        elements.assetPreview.src = candidate.previewUrl;
+        elements.fileName.textContent = candidate.fileName || '-';
+        elements.currentDate.textContent = candidate.currentDateTimeLocal || 'Nema postavljen datum';
+        elements.proposedDate.textContent = candidate.proposedDateTimeLocal || '-';
+        elements.proposedReason.textContent = candidate.parserReason || '';
+
+        const status = payload.status || {};
+        const parts = [];
+        if (typeof status.remaining === 'number') {
+          parts.push(`Preostalo: ${status.remaining}`);
+        }
+        if (typeof status.total === 'number') {
+          parts.push(`Ukupno: ${status.total}`);
+        }
+        if (typeof status.applied === 'number') {
+          parts.push(`Postavljeno: ${status.applied}`);
+        }
+        if (typeof status.skipped === 'number') {
+          parts.push(`Preskoceno: ${status.skipped}`);
+        }
+        if (typeof status.deleted === 'number') {
+          parts.push(`Obrisano: ${status.deleted}`);
+        }
+        if (typeof status.failed === 'number') {
+          parts.push(`Greske: ${status.failed}`);
+        }
+        elements.queueStatus.textContent = parts.join(' · ') || '-';
+      }
+
+      function renderBackgroundJob(payload) {
+        const job = payload?.job || null;
+        if (!job) {
+          return;
+        }
+        const jobParts = [
+          `Background: ${job.status}`,
+          `Obradeno: ${job.processed}/${job.totalAtStart}`,
+          `Postavljeno: ${job.applied}`,
+          `Greske: ${job.failed}`,
+        ];
+        elements.statusMessage.textContent = jobParts.join(' · ');
+      }
+
+      async function loadNext(message = '') {
+        setBusy(true);
+        elements.statusMessage.textContent = message;
+        try {
+          const payload = await request('/utilities/exifdatefix/api/date-from-filename/next');
+          if (payload) {
+            render(payload);
+          }
+          elements.statusMessage.textContent = '';
+        } catch (error) {
+          elements.statusMessage.textContent = error.message;
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function submit(action) {
+        if (!state.candidate || state.busy) {
+          return;
+        }
+
+        setBusy(true);
+        elements.statusMessage.textContent =
+          action === 'apply' ? 'Upisujem datum...' : action === 'delete' ? 'Saljem asset u trash...' : 'Preskacem asset...';
+        try {
+          const payload = await request(`/utilities/exifdatefix/api/date-from-filename/${action}`, {
+            method: 'POST',
+            body: JSON.stringify({ assetId: state.candidate.assetId }),
+          });
+          if (payload) {
+            render(payload);
+          }
+
+          const statusMessage =
+            action === 'apply'
+              ? `Datum postavljen za ${payload.updatedAsset?.originalFileName || 'asset'}.`
+              : action === 'delete'
+                ? 'Asset je prebacen u trash.'
+              : 'Asset je preskocen.';
+          elements.statusMessage.textContent = statusMessage;
+        } catch (error) {
+          elements.statusMessage.textContent = error.message;
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function startBackgroundApply() {
+        if (state.busy) {
+          return;
+        }
+        setBusy(true);
+        elements.statusMessage.textContent = 'Pokrecem background obradu...';
+        try {
+          const payload = await request('/utilities/exifdatefix/api/date-from-filename/background-apply', {
+            method: 'POST',
+            body: JSON.stringify({}),
+          });
+          renderBackgroundJob(payload);
+        } catch (error) {
+          elements.statusMessage.textContent = error.message;
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function refreshBackgroundStatus() {
+        try {
+          const payload = await request('/utilities/exifdatefix/api/date-from-filename/background-status');
+          if (payload?.job) {
+            renderBackgroundJob(payload);
+            if (payload.job.status === 'running') {
+              const nextPayload = await request('/utilities/exifdatefix/api/date-from-filename/next');
+              if (nextPayload) {
+                render(nextPayload);
+              }
+            }
+          }
+        } catch (error) {
+        }
+      }
+
+      elements.applyButton.addEventListener('click', () => submit('apply'));
+      elements.skipButton.addEventListener('click', () => submit('skip'));
+      elements.deleteButton.addEventListener('click', () => submit('delete'));
+      elements.backgroundApplyButton.addEventListener('click', () => startBackgroundApply());
+
+      loadNext('Ucitavam prvi kandidat...');
+      setInterval(refreshBackgroundStatus, 3000);
+    </script>
+  </body>
+</html>

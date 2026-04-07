@@ -175,14 +175,22 @@ The service itself remains deployed with `MEDIA_OPS_DRY_RUN=true`, but the follo
 - The utility looks for assets whose filename contains a trustworthy date pattern and where the stored capture date is either missing or suspicious.
 - Supported filename families currently include:
   - `YYYYMMDD_HHMMSS`
+  - `YYYYMMDDHHMMSS`
+  - `YYYYMMDDHMMSS`
   - `YYYY-MM-DD HH.MM.SS`
+  - `YYYY_MM_DD_HH_MM_SS`
   - `PXL_YYYYMMDD_HHMMSS`
   - `Screenshot_YYYYMMDD-HHMMSS`
+  - `screen_<hash>_<epoch-ms>` and `screen_<hash>_<epoch-ms>-edited`
   - `signal-YYYY-MM-DD-HHMMSS`
   - `IMG-YYYYMMDD-WA...` and `VID-YYYYMMDD-WA...`
+  - `DJI<epoch-ms>`
   - `FB_IMG_<epoch-ms>`
   - `FACE_SC_<epoch-ms>`
   - `PicPlus_<epoch-ms>`
+- The parser now validates extracted date parts before proposing them:
+  - invalid month/day/hour/minute/second combinations are discarded instead of breaking the whole queue
+  - this keeps compact numeric filename support usable without accepting accidental false positives
 - When a match is found, the utility normalizes the detected value into:
   - Immich metadata update payloads
   - file-level EXIF/XMP writeback via `exiftool`
@@ -194,9 +202,24 @@ The service itself remains deployed with `MEDIA_OPS_DRY_RUN=true`, but the follo
   - `gif`
   - `heic`
   - `heif`
+  - `mp4`
+  - `mov`
+  - `3gp`
+- For video assets, the writeback path also updates QuickTime metadata fields:
+  - `CreateDate`
+  - `ModifyDate`
+  - `TrackCreateDate`
+  - `TrackModifyDate`
+  - `MediaCreateDate`
+  - `MediaModifyDate`
+  - `Keys:CreationDate`
+- The utility was also exercised against real problem clusters during cleanup:
+  - DJI exports where the filename is an epoch timestamp
+  - `screen_...` Android exports that store an epoch timestamp at the end of the name
+  - compact numeric camera names such as `20140407235852.jpg`, `2014040803738.jpg`, and `20200223125641.gif`
 - The utility is still intentionally conservative:
   - it only proposes dates when the filename pattern is recognized with confidence
-  - assets with opaque names still require manual review or another source of truth
+  - assets with opaque names such as `image-<hash>.jpg` still require manual review or another source of truth
 
 ## EXIF GPS Fix Utility
 

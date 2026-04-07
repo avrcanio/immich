@@ -45,7 +45,7 @@ const utilitiesHtmlPath = '/app/utilities.html';
 const deleteLookupTtlMs = 30 * 24 * 60 * 60 * 1000;
 const utilityRowsCacheTtlMs = 5 * 60 * 1000;
 const utilityCandidateQueueCacheTtlMs = 5 * 60 * 1000;
-const SUPPORTED_UTILITY_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif']);
+const SUPPORTED_UTILITY_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif', 'mp4', 'mov', '3gp']);
 const SMART_ALBUM_DEFINITIONS = Object.freeze([
   { name: 'No Faces', matcher: (input) => input.faceCount === 0 },
   { name: 'Screenshots', matcher: (input) => config.smartAlbumsScreenshotsEnabled && isScreenshotCandidate(input.fileName) },
@@ -809,10 +809,10 @@ function getDateFromFilenameRows(context) {
     left join asset_exif ae on ae."assetId" = a.id
     where a."ownerId" = ${sqlString(context.immichUserId)}
       and a."deletedAt" is null
-      and a.type = 'IMAGE'
+      and a.type in ('IMAGE', 'VIDEO')
       and (${libraryPathCondition})
-      and lower(a."originalFileName") ~ '\\.(jpg|jpeg|png|webp|gif|heic|heif)$'
-      and lower(a."originalFileName") ~ '(screenshot_|pxl_|signal-|fb_img_\\d{13}|face_sc_\\d{13}|picplus_\\d{13}|img[-_]\\d{8}-wa|vid[-_]\\d{8}-wa|\\d{8}[_ -]\\d{6}|\\d{4}-\\d{2}-\\d{2}[ _. -]\\d{2}[.:_-]\\d{2}[.:_-]\\d{2})'
+      and lower(a."originalFileName") ~ '\\.(jpg|jpeg|png|webp|gif|heic|heif|mp4|mov|3gp)$'
+      and lower(a."originalFileName") ~ '(screenshot_|screen_[a-f0-9]+_\\d{13}(?:-edited)?|pxl_|signal-|fb_img_\\d{13}|face_sc_\\d{13}|picplus_\\d{13}|img[-_]\\d{8}-wa|vid[-_]\\d{8}-wa|dji\\d{13}|\\d{8}[_ -]\\d{6}|\\d{14}|\\d{13}|\\d{4}-\\d{2}-\\d{2}[ _. -]\\d{2}[.:_-]\\d{2}[.:_-]\\d{2}|\\d{4}_\\d{2}_\\d{2}_\\d{2}_\\d{2}_\\d{2})'
     order by a."fileCreatedAt" asc, a.id asc;
   `;
 
@@ -903,8 +903,23 @@ function parseDateFromFilename(fileName, fileCreatedAt, localDateTime) {
       confidence: 'high',
     },
     {
+      regex: /(?:^|[^0-9])(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:[^0-9]|$)/,
+      reason: 'Prepoznat obrazac YYYYMMDDHHMMSS',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])(\d{4})(\d{2})(\d{2})(\d)(\d{2})(\d{2})(?:[^0-9]|$)/,
+      reason: 'Prepoznat obrazac YYYYMMDDHMMSS',
+      confidence: 'medium',
+    },
+    {
       regex: /(?:^|[^0-9])(\d{4})-(\d{2})-(\d{2})[ _. -](\d{2})[.:_-](\d{2})[.:_-](\d{2})(?:[^0-9]|$)/,
       reason: 'Prepoznat obrazac YYYY-MM-DD HH.MM.SS',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})(?:[^0-9]|$)/,
+      reason: 'Prepoznat obrazac YYYY_MM_DD_HH_MM_SS',
       confidence: 'high',
     },
     {
@@ -929,7 +944,10 @@ function parseDateFromFilename(fileName, fileCreatedAt, localDateTime) {
     if (!match) {
       continue;
     }
-    return buildParsedDateTime(match.slice(1, 7), pattern.reason, pattern.confidence);
+    const parsed = buildParsedDateTime(match.slice(1, 7), pattern.reason, pattern.confidence);
+    if (parsed) {
+      return parsed;
+    }
   }
 
   const whatsappMatch = baseName.match(/(?:IMG|VID)[-_](\d{4})(\d{2})(\d{2})[-_]WA\d+/i);
@@ -950,15 +968,64 @@ function parseDateFromFilename(fileName, fileCreatedAt, localDateTime) {
     );
   }
 
+  const djiEpochMatch = baseName.match(/^dji(\d{13})$/i);
+  if (djiEpochMatch) {
+    return buildParsedDateTimeFromEpochMilliseconds(
+      djiEpochMatch[1],
+      'Prepoznat DJI epoch timestamp u nazivu datoteke',
+      'high',
+    );
+  }
+
+  const screenEpochMatch = baseName.match(/^screen_[a-f0-9]+_(\d{13})(?:-edited)?$/i);
+  if (screenEpochMatch) {
+    return buildParsedDateTimeFromEpochMilliseconds(
+      screenEpochMatch[1],
+      'Prepoznat screen epoch timestamp u nazivu datoteke',
+      'high',
+    );
+  }
+
   return null;
 }
 
 function buildParsedDateTime(parts, reason, confidence) {
   const [year, month, day, hour, minute, second] = parts.map((value) => String(value).padStart(2, '0'));
+  if (!isValidParsedDateTimeParts(year, month, day, hour, minute, second)) {
+    return null;
+  }
   const local = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
   const iso = `${year}-${month}-${day}T${hour}:${minute}:${second}${resolveTimezoneOffset(year, month, day)}`;
   const exif = `${year}:${month}:${day} ${hour}:${minute}:${second}`;
   return { iso, exif, local, date: `${year}-${month}-${day}`, reason, confidence };
+}
+
+function isValidParsedDateTimeParts(year, month, day, hour, minute, second) {
+  const normalizedYear = Number(year);
+  const normalizedMonth = Number(month);
+  const normalizedDay = Number(day);
+  const normalizedHour = Number(hour);
+  const normalizedMinute = Number(minute);
+  const normalizedSecond = Number(second);
+
+  if (!Number.isInteger(normalizedYear) || normalizedYear < 1970 || normalizedYear > 2100) {
+    return false;
+  }
+  if (!Number.isInteger(normalizedMonth) || normalizedMonth < 1 || normalizedMonth > 12) {
+    return false;
+  }
+  if (!Number.isInteger(normalizedHour) || normalizedHour < 0 || normalizedHour > 23) {
+    return false;
+  }
+  if (!Number.isInteger(normalizedMinute) || normalizedMinute < 0 || normalizedMinute > 59) {
+    return false;
+  }
+  if (!Number.isInteger(normalizedSecond) || normalizedSecond < 0 || normalizedSecond > 59) {
+    return false;
+  }
+
+  const maxDay = new Date(Date.UTC(normalizedYear, normalizedMonth, 0)).getUTCDate();
+  return Number.isInteger(normalizedDay) && normalizedDay >= 1 && normalizedDay <= maxDay;
 }
 
 function buildParsedDateTimeFromEpochMilliseconds(epochMilliseconds, reason, confidence) {
@@ -1097,6 +1164,18 @@ function applyExifDateTime(originalPath, exifDateTime, extension) {
 
   if (extension === 'heic' || extension === 'heif') {
     command.push(`-QuickTime:CreateDate=${exifDateTime}`, `-QuickTime:ModifyDate=${exifDateTime}`);
+  }
+
+  if (extension === 'mp4' || extension === 'mov' || extension === '3gp') {
+    command.push(
+      `-QuickTime:CreateDate=${exifDateTime}`,
+      `-QuickTime:ModifyDate=${exifDateTime}`,
+      `-QuickTime:TrackCreateDate=${exifDateTime}`,
+      `-QuickTime:TrackModifyDate=${exifDateTime}`,
+      `-QuickTime:MediaCreateDate=${exifDateTime}`,
+      `-QuickTime:MediaModifyDate=${exifDateTime}`,
+      `-Keys:CreationDate=${exifDateTime}`,
+    );
   }
 
   command.push(originalPath);
@@ -2242,10 +2321,10 @@ function getDateFromFilenameRows(context) {
     left join asset_exif ae on ae."assetId" = a.id
     where a."ownerId" = ${sqlString(context.immichUserId)}
       and a."deletedAt" is null
-      and a.type = 'IMAGE'
+      and a.type in ('IMAGE', 'VIDEO')
       and (${libraryPathCondition})
-      and lower(a."originalFileName") ~ '\\.(jpg|jpeg|png|webp|gif|heic|heif)$'
-      and lower(a."originalFileName") ~ '(screenshot_|pxl_|signal-|fb_img_\\d{13}|face_sc_\\d{13}|picplus_\\d{13}|img[-_]\\d{8}-wa|vid[-_]\\d{8}-wa|\\d{8}[_ -]\\d{6}|\\d{4}-\\d{2}-\\d{2}[ _. -]\\d{2}[.:_-]\\d{2}[.:_-]\\d{2})'
+      and lower(a."originalFileName") ~ '\\.(jpg|jpeg|png|webp|gif|heic|heif|mp4|mov|3gp)$'
+      and lower(a."originalFileName") ~ '(screenshot_|screen_[a-f0-9]+_\\d{13}(?:-edited)?|pxl_|signal-|fb_img_\\d{13}|face_sc_\\d{13}|picplus_\\d{13}|img[-_]\\d{8}-wa|vid[-_]\\d{8}-wa|dji\\d{13}|\\d{8}[_ -]\\d{6}|\\d{14}|\\d{13}|\\d{4}-\\d{2}-\\d{2}[ _. -]\\d{2}[.:_-]\\d{2}[.:_-]\\d{2}|\\d{4}_\\d{2}_\\d{2}_\\d{2}_\\d{2}_\\d{2})'
     order by a."fileCreatedAt" asc, a.id asc;
   `;
 
@@ -2332,8 +2411,23 @@ function parseDateFromFilename(fileName, fileCreatedAt, localDateTime) {
       confidence: 'high',
     },
     {
+      regex: /(?:^|[^0-9])(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(?:[^0-9]|$)/,
+      reason: 'Prepoznat obrazac YYYYMMDDHHMMSS',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])(\d{4})(\d{2})(\d{2})(\d)(\d{2})(\d{2})(?:[^0-9]|$)/,
+      reason: 'Prepoznat obrazac YYYYMMDDHMMSS',
+      confidence: 'medium',
+    },
+    {
       regex: /(?:^|[^0-9])(\d{4})-(\d{2})-(\d{2})[ _. -](\d{2})[.:_-](\d{2})[.:_-](\d{2})(?:[^0-9]|$)/,
       reason: 'Prepoznat obrazac YYYY-MM-DD HH.MM.SS',
+      confidence: 'high',
+    },
+    {
+      regex: /(?:^|[^0-9])(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})(?:[^0-9]|$)/,
+      reason: 'Prepoznat obrazac YYYY_MM_DD_HH_MM_SS',
       confidence: 'high',
     },
     {
@@ -2358,7 +2452,10 @@ function parseDateFromFilename(fileName, fileCreatedAt, localDateTime) {
     if (!match) {
       continue;
     }
-    return buildParsedDateTime(match.slice(1, 7), pattern.reason, pattern.confidence);
+    const parsed = buildParsedDateTime(match.slice(1, 7), pattern.reason, pattern.confidence);
+    if (parsed) {
+      return parsed;
+    }
   }
 
   const whatsappMatch = baseName.match(/(?:IMG|VID)[-_](\d{4})(\d{2})(\d{2})[-_]WA\d+/i);
@@ -2379,15 +2476,64 @@ function parseDateFromFilename(fileName, fileCreatedAt, localDateTime) {
     );
   }
 
+  const djiEpochMatch = baseName.match(/^dji(\d{13})$/i);
+  if (djiEpochMatch) {
+    return buildParsedDateTimeFromEpochMilliseconds(
+      djiEpochMatch[1],
+      'Prepoznat DJI epoch timestamp u nazivu datoteke',
+      'high',
+    );
+  }
+
+  const screenEpochMatch = baseName.match(/^screen_[a-f0-9]+_(\d{13})(?:-edited)?$/i);
+  if (screenEpochMatch) {
+    return buildParsedDateTimeFromEpochMilliseconds(
+      screenEpochMatch[1],
+      'Prepoznat screen epoch timestamp u nazivu datoteke',
+      'high',
+    );
+  }
+
   return null;
 }
 
 function buildParsedDateTime(parts, reason, confidence) {
   const [year, month, day, hour, minute, second] = parts.map((value) => String(value).padStart(2, '0'));
+  if (!isValidParsedDateTimeParts(year, month, day, hour, minute, second)) {
+    return null;
+  }
   const local = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
   const iso = `${year}-${month}-${day}T${hour}:${minute}:${second}${resolveTimezoneOffset(year, month, day)}`;
   const exif = `${year}:${month}:${day} ${hour}:${minute}:${second}`;
   return { iso, exif, local, date: `${year}-${month}-${day}`, reason, confidence };
+}
+
+function isValidParsedDateTimeParts(year, month, day, hour, minute, second) {
+  const normalizedYear = Number(year);
+  const normalizedMonth = Number(month);
+  const normalizedDay = Number(day);
+  const normalizedHour = Number(hour);
+  const normalizedMinute = Number(minute);
+  const normalizedSecond = Number(second);
+
+  if (!Number.isInteger(normalizedYear) || normalizedYear < 1970 || normalizedYear > 2100) {
+    return false;
+  }
+  if (!Number.isInteger(normalizedMonth) || normalizedMonth < 1 || normalizedMonth > 12) {
+    return false;
+  }
+  if (!Number.isInteger(normalizedHour) || normalizedHour < 0 || normalizedHour > 23) {
+    return false;
+  }
+  if (!Number.isInteger(normalizedMinute) || normalizedMinute < 0 || normalizedMinute > 59) {
+    return false;
+  }
+  if (!Number.isInteger(normalizedSecond) || normalizedSecond < 0 || normalizedSecond > 59) {
+    return false;
+  }
+
+  const maxDay = new Date(Date.UTC(normalizedYear, normalizedMonth, 0)).getUTCDate();
+  return Number.isInteger(normalizedDay) && normalizedDay >= 1 && normalizedDay <= maxDay;
 }
 
 function extractFallbackTime(value) {
@@ -2475,6 +2621,18 @@ function applyExifDateTime(originalPath, exifDateTime, extension) {
 
   if (extension === 'heic' || extension === 'heif') {
     command.push(`-QuickTime:CreateDate=${exifDateTime}`, `-QuickTime:ModifyDate=${exifDateTime}`);
+  }
+
+  if (extension === 'mp4' || extension === 'mov' || extension === '3gp') {
+    command.push(
+      `-QuickTime:CreateDate=${exifDateTime}`,
+      `-QuickTime:ModifyDate=${exifDateTime}`,
+      `-QuickTime:TrackCreateDate=${exifDateTime}`,
+      `-QuickTime:TrackModifyDate=${exifDateTime}`,
+      `-QuickTime:MediaCreateDate=${exifDateTime}`,
+      `-QuickTime:MediaModifyDate=${exifDateTime}`,
+      `-Keys:CreationDate=${exifDateTime}`,
+    );
   }
 
   command.push(originalPath);

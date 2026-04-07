@@ -61,6 +61,10 @@ fs.mkdirSync(config.stateDir, { recursive: true });
 const utilityRowsCache = new Map();
 const utilityCandidateQueueCache = new Map();
 const utilityBackgroundJobs = new Map();
+const gpsUtilityRowsCache = new Map();
+const gpsUtilityCandidateQueueCache = new Map();
+const gpsUtilityBackgroundJobs = new Map();
+const gpsUtilityWritebackQueues = new Map();
 
 async function main() {
   const { command, args } = parseCommand(process.argv.slice(2));
@@ -90,6 +94,7 @@ async function serve() {
     try {
       const requestUrl = new URL(request.url || '/', 'http://media-operations.local');
       const utilityApiPath = requestUrl.pathname.replace(/^\/utilities\/exifdatefix\/api/, '/utility/exifdatefix/api');
+      const gpsUtilityApiPath = requestUrl.pathname.replace(/^\/utilities\/exifgpsfix\/api/, '/utility/exifgpsfix/api');
 
       if (request.method === 'GET' && request.url === '/healthz') {
         return respondJson(response, 200, {
@@ -155,6 +160,49 @@ async function serve() {
       if (request.method === 'POST' && utilityApiPath === '/utility/exifdatefix/api/date-from-filename/background-apply') {
         verifyUtilityMutationRequest(request);
         const result = await handleDateFromFilenameBackgroundApply(request);
+        return respondJson(response, 200, result);
+      }
+
+      if (request.method === 'GET' && gpsUtilityApiPath === '/utility/exifgpsfix/api/next') {
+        const payload = await buildGpsFixResponse(request, {
+          refresh: requestUrl.searchParams.get('refresh') === '1',
+        });
+        return respondJson(response, 200, payload);
+      }
+
+      if (request.method === 'GET' && gpsUtilityApiPath === '/utility/exifgpsfix/api/status') {
+        const payload = await buildGpsFixResponse(request, { includeCandidate: false });
+        return respondJson(response, 200, payload);
+      }
+
+      if (request.method === 'GET' && gpsUtilityApiPath === '/utility/exifgpsfix/api/background-status') {
+        const payload = await buildGpsFixBackgroundStatusResponse(request);
+        return respondJson(response, 200, payload);
+      }
+
+      if (request.method === 'GET' && gpsUtilityApiPath === '/utility/exifgpsfix/api/refresh') {
+        const payload = await buildGpsFixRefreshResponse(request);
+        return respondJson(response, 200, payload);
+      }
+
+      if (request.method === 'POST' && gpsUtilityApiPath === '/utility/exifgpsfix/api/skip') {
+        verifyUtilityMutationRequest(request);
+        const payload = await readJsonBody(request);
+        const result = await handleGpsFixSkip(request, payload);
+        return respondJson(response, 200, result);
+      }
+
+      if (request.method === 'POST' && gpsUtilityApiPath === '/utility/exifgpsfix/api/apply') {
+        verifyUtilityMutationRequest(request);
+        const payload = await readJsonBody(request);
+        const result = await handleGpsFixApply(request, payload);
+        return respondJson(response, 200, result);
+      }
+
+      if (request.method === 'POST' && gpsUtilityApiPath === '/utility/exifgpsfix/api/delete') {
+        verifyUtilityMutationRequest(request);
+        const payload = await readJsonBody(request);
+        const result = await handleGpsFixDelete(request, payload);
         return respondJson(response, 200, result);
       }
 
@@ -943,6 +991,27 @@ function buildParsedDateTimeFromEpochMilliseconds(epochMilliseconds, reason, con
   );
 }
 
+function buildParsedDateTimeFromManualInput(dateValue, timeValue) {
+  if (!dateValue && !timeValue) {
+    return null;
+  }
+  if (!dateValue || !timeValue) {
+    throw httpError(400, 'Date and time must both be provided');
+  }
+
+  const dateMatch = String(dateValue).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const timeMatch = String(timeValue).match(/^(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!dateMatch || !timeMatch) {
+    throw httpError(400, 'Invalid date or time format');
+  }
+
+  return buildParsedDateTime(
+    [dateMatch[1], dateMatch[2], dateMatch[3], timeMatch[1], timeMatch[2], timeMatch[3] || '00'],
+    'Rucno odabran datum i vrijeme',
+    'manual',
+  );
+}
+
 function extractFallbackTime(value) {
   if (!value) {
     return null;
@@ -1043,11 +1112,51 @@ function applyExifDateTime(originalPath, exifDateTime, extension) {
   }
 }
 
+function applyExifGps(originalPath, latitude, longitude, extension) {
+  const normalizedLatitude = Number(latitude);
+  const normalizedLongitude = Number(longitude);
+  if (!Number.isFinite(normalizedLatitude) || !Number.isFinite(normalizedLongitude)) {
+    throw httpError(400, 'Invalid GPS coordinates');
+  }
+
+  const command = [
+    '-overwrite_original',
+    '-P',
+    `-GPSLatitude=${Math.abs(normalizedLatitude)}`,
+    `-GPSLatitudeRef=${normalizedLatitude < 0 ? 'S' : 'N'}`,
+    `-GPSLongitude=${Math.abs(normalizedLongitude)}`,
+    `-GPSLongitudeRef=${normalizedLongitude < 0 ? 'W' : 'E'}`,
+  ];
+
+  if (extension === 'heic' || extension === 'heif') {
+    command.push(`-QuickTime:GPSCoordinates=${normalizedLatitude} ${normalizedLongitude}`);
+  }
+
+  command.push(originalPath);
+
+  try {
+    execFileSync('exiftool', command, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    const output = `${error.stdout || ''}\n${error.stderr || ''}`.trim();
+    throw httpError(500, `EXIF GPS writeback failed: ${output || error.message}`);
+  }
+}
+
 function loadUtilityState() {
-  const state = loadJson(utilityStatePath, { dateFromFilename: { users: {} } });
+  const state = loadJson(utilityStatePath, {
+    dateFromFilename: { users: {} },
+    gpsFix: { users: {} },
+  });
   const users = state.dateFromFilename && typeof state.dateFromFilename === 'object' ? state.dateFromFilename.users : {};
   state.dateFromFilename = {
     users: users && typeof users === 'object' ? users : {},
+  };
+  const gpsUsers = state.gpsFix && typeof state.gpsFix === 'object' ? state.gpsFix.users : {};
+  state.gpsFix = {
+    users: gpsUsers && typeof gpsUsers === 'object' ? gpsUsers : {},
   };
   return state;
 }
@@ -1064,6 +1173,812 @@ function ensureUtilityUserState(state, nextcloudUserId) {
   users[nextcloudUserId].deleted = users[nextcloudUserId].deleted && typeof users[nextcloudUserId].deleted === 'object' ? users[nextcloudUserId].deleted : {};
   users[nextcloudUserId].failed = users[nextcloudUserId].failed && typeof users[nextcloudUserId].failed === 'object' ? users[nextcloudUserId].failed : {};
   return users[nextcloudUserId];
+}
+
+function ensureGpsUtilityUserState(state, nextcloudUserId) {
+  const users = state.gpsFix.users;
+  users[nextcloudUserId] = users[nextcloudUserId] || { applied: {}, skipped: {}, failed: {} };
+  users[nextcloudUserId].applied = users[nextcloudUserId].applied && typeof users[nextcloudUserId].applied === 'object' ? users[nextcloudUserId].applied : {};
+  users[nextcloudUserId].skipped = users[nextcloudUserId].skipped && typeof users[nextcloudUserId].skipped === 'object' ? users[nextcloudUserId].skipped : {};
+  users[nextcloudUserId].failed = users[nextcloudUserId].failed && typeof users[nextcloudUserId].failed === 'object' ? users[nextcloudUserId].failed : {};
+  return users[nextcloudUserId];
+}
+
+async function buildGpsFixResponse(request, options = {}) {
+  const includeCandidate = options.includeCandidate !== false;
+  const context = await createUtilityContextFromRequest(request);
+  if (options.refresh) {
+    invalidateGpsFixCaches(context);
+  }
+  const queue = getGpsFixQueue(context, options);
+
+  return {
+    status: {
+      remaining: queue.remaining,
+      total: queue.total,
+      applied: queue.applied,
+      skipped: queue.skipped,
+      failed: queue.failed,
+    },
+    candidate: includeCandidate ? queue.candidate : null,
+    job: sanitizeGpsUtilityBackgroundJob(getGpsUtilityBackgroundJob(context.nextcloudUserId)),
+  };
+}
+
+async function buildGpsFixRefreshResponse(request) {
+  const requestUrl = new URL(request.url || '/', 'http://media-operations.local');
+  const assetId = requiredString(requestUrl.searchParams.get('assetId'), 'assetId');
+  const context = await createUtilityContextFromRequest(request);
+  invalidateGpsFixCaches(context);
+
+  const rows = getGpsFixRows(context);
+  const row = rows.find((entry) => entry.assetId === assetId);
+  const assetRecord = row || getGpsUtilityAssetRecord(context, assetId);
+
+  const state = loadUtilityState();
+  const userState = ensureGpsUtilityUserState(state, context.nextcloudUserId);
+
+  return {
+    status: {
+      remaining: getGpsFixQueue(context, { rows }).remaining,
+      total: rows.length,
+      applied: Object.keys(userState.applied || {}).length,
+      skipped: Object.keys(userState.skipped || {}).length,
+      failed: Object.keys(userState.failed || {}).length,
+    },
+    candidate: buildGpsFixCandidate(context, {
+      assetId: assetRecord.assetId,
+      fileName: assetRecord.fileName,
+      originalPath: assetRecord.originalPath,
+      fileCreatedAt: assetRecord.fileCreatedAt,
+      localDateTime: assetRecord.localDateTime,
+      dateTimeOriginal: assetRecord.dateTimeOriginal,
+      latitude: assetRecord.latitude,
+      longitude: assetRecord.longitude,
+      sortDateTime: assetRecord.dateTimeOriginal || assetRecord.localDateTime || assetRecord.fileCreatedAt || null,
+    }),
+    job: sanitizeGpsUtilityBackgroundJob(getGpsUtilityBackgroundJob(context.nextcloudUserId)),
+  };
+}
+
+async function buildGpsFixBackgroundStatusResponse(request) {
+  const context = await createUtilityContextFromRequest(request);
+  return {
+    job: sanitizeGpsUtilityBackgroundJob(getGpsUtilityBackgroundJob(context.nextcloudUserId)),
+  };
+}
+
+async function handleGpsFixSkip(request, payload) {
+  const context = await createUtilityContextFromRequest(request);
+  const assetId = requiredString(payload.assetId, 'assetId');
+  const rows = getGpsFixRows(context);
+  const queue = getGpsFixQueue(context, { rows });
+
+  if (!queue.candidate || queue.candidate.assetId !== assetId) {
+    throw httpError(409, 'Asset is no longer the active GPS utility candidate');
+  }
+
+  const state = loadUtilityState();
+  const userState = ensureGpsUtilityUserState(state, context.nextcloudUserId);
+  userState.skipped[assetId] = {
+    decidedAt: new Date().toISOString(),
+    fileName: queue.candidate.fileName,
+    currentDateTimeIso: queue.candidate.currentDateTimeIso,
+  };
+  saveUtilityState(state);
+
+  writeAuditEntry({
+    kind: 'utility-gps-fix-skip',
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+    assetId,
+    fileName: queue.candidate.fileName,
+  });
+
+  markGpsUtilityQueueAssetProcessed(context, assetId);
+  return buildGpsFixResponseFromContext(context, { rows, excludeAssetIds: [assetId] });
+}
+
+async function handleGpsFixApply(request, payload) {
+  const context = await createUtilityContextFromRequest(request, { requireAuthenticatedContext: true });
+  const assetId = requiredString(payload.assetId, 'assetId');
+  const latitude = optionalNumber(payload.latitude);
+  const longitude = optionalNumber(payload.longitude);
+  const manualDateTime = buildParsedDateTimeFromManualInput(optionalString(payload.manualDate), optionalString(payload.manualTime));
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    throw httpError(400, 'Apply requires latitude and longitude');
+  }
+
+  const rows = getGpsFixRows(context);
+  const queue = getGpsFixQueue(context, { rows });
+  if (!queue.candidate || queue.candidate.assetId !== assetId) {
+    throw httpError(409, 'Asset is no longer the active GPS utility candidate');
+  }
+
+  const assetRecord = getGpsUtilityAssetRecord(context, assetId);
+  if (!shouldOfferGpsFix(assetRecord)) {
+    throw httpError(409, 'Asset no longer requires a GPS correction');
+  }
+
+  await immichRequest(context.accessToken, 'PUT', '/assets', {
+    ids: [assetId],
+    latitude,
+    longitude,
+    ...(manualDateTime ? { dateTimeOriginal: manualDateTime.iso } : {}),
+  });
+
+  const selectedSource = resolveGpsSelectionSource(queue.candidate, latitude, longitude, optionalString(payload.source));
+  const state = loadUtilityState();
+  const userState = ensureGpsUtilityUserState(state, context.nextcloudUserId);
+  userState.applied[assetId] = {
+    decidedAt: new Date().toISOString(),
+    fileName: queue.candidate.fileName,
+    originalPath: assetRecord.originalPath,
+    latitude,
+    longitude,
+    source: selectedSource,
+    dateTimeOriginal: manualDateTime?.iso || null,
+  };
+  delete userState.skipped[assetId];
+  delete userState.failed[assetId];
+  saveUtilityState(state);
+
+  writeAuditEntry({
+    kind: 'utility-gps-fix-apply',
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+    assetId,
+    fileName: queue.candidate.fileName,
+    originalPath: assetRecord.originalPath,
+    latitude,
+    longitude,
+    source: selectedSource,
+    dateTimeOriginal: manualDateTime?.iso || null,
+  });
+
+  enqueueGpsExifWriteback(context, {
+    assetId,
+    fileName: queue.candidate.fileName,
+    originalPath: assetRecord.originalPath,
+    latitude,
+    longitude,
+    dateTimeOriginal: manualDateTime?.iso || null,
+    exifDateTime: manualDateTime?.exif || null,
+    extension: getFileExtension(assetRecord.fileName),
+  });
+
+  markGpsUtilityQueueAssetProcessed(context, assetId);
+  return buildGpsFixResponseFromContext(context, { rows, excludeAssetIds: [assetId] });
+}
+
+async function handleGpsFixDelete(request, payload) {
+  const context = await createUtilityContextFromRequest(request, { requireAuthenticatedContext: true });
+  const assetId = requiredString(payload.assetId, 'assetId');
+  const rows = getGpsFixRows(context);
+  const queue = getGpsFixQueue(context, { rows });
+
+  if (!queue.candidate || queue.candidate.assetId !== assetId) {
+    throw httpError(409, 'Asset is no longer the active GPS utility candidate');
+  }
+
+  const assetRecord = getGpsUtilityAssetRecord(context, assetId);
+  await immichRequest(context.accessToken, 'DELETE', '/assets', {
+    ids: [assetId],
+    force: false,
+  });
+
+  const state = loadUtilityState();
+  const userState = ensureGpsUtilityUserState(state, context.nextcloudUserId);
+  userState.skipped[assetId] = {
+    decidedAt: new Date().toISOString(),
+    fileName: queue.candidate.fileName,
+    deleted: true,
+    originalPath: assetRecord.originalPath,
+  };
+  delete userState.failed[assetId];
+  saveUtilityState(state);
+
+  writeAuditEntry({
+    kind: 'utility-gps-fix-delete',
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+    assetId,
+    fileName: queue.candidate.fileName,
+    originalPath: assetRecord.originalPath,
+    deleteMode: 'trash',
+  });
+
+  markGpsUtilityQueueAssetProcessed(context, assetId);
+  return buildGpsFixResponseFromContext(context, { rows, excludeAssetIds: [assetId] });
+}
+
+function buildGpsFixResponseFromContext(context, options = {}) {
+  const includeCandidate = options.includeCandidate !== false;
+  const queue = getGpsFixQueue(context, options);
+
+  return {
+    status: {
+      remaining: queue.remaining,
+      total: queue.total,
+      applied: queue.applied,
+      skipped: queue.skipped,
+      failed: queue.failed,
+    },
+    candidate: includeCandidate ? queue.candidate : null,
+    job: sanitizeGpsUtilityBackgroundJob(getGpsUtilityBackgroundJob(context.nextcloudUserId)),
+  };
+}
+
+function getGpsFixQueue(context, options = {}) {
+  const state = loadUtilityState();
+  const userState = ensureGpsUtilityUserState(state, context.nextcloudUserId);
+
+  if (!options.rows && !options.excludeAssetIds?.length) {
+    const materializedQueue = getMaterializedGpsUtilityCandidateQueue(context, userState);
+    return {
+      candidate: materializedQueue.candidates[0] ? buildGpsFixCandidate(context, materializedQueue.candidates[0]) : null,
+      remaining: materializedQueue.candidates.length,
+      total: materializedQueue.total,
+      applied: Object.keys(userState.applied || {}).length,
+      skipped: Object.keys(userState.skipped || {}).length,
+      failed: Object.keys(userState.failed || {}).length,
+    };
+  }
+
+  const rows = options.rows || getGpsFixRows(context);
+  const excludedAssetIds = new Set(options.excludeAssetIds || []);
+  const candidates = buildGpsUtilityCandidateRows(rows, userState, excludedAssetIds);
+
+  return {
+    candidate: candidates[0] ? buildGpsFixCandidate(context, candidates[0]) : null,
+    remaining: candidates.length,
+    total: rows.length,
+    applied: Object.keys(userState.applied || {}).length,
+    skipped: Object.keys(userState.skipped || {}).length,
+    failed: Object.keys(userState.failed || {}).length,
+  };
+}
+
+function getMaterializedGpsUtilityCandidateQueue(context, userState) {
+  const cacheKey = buildGpsUtilityRowsCacheKey(context);
+  const cached = gpsUtilityCandidateQueueCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached;
+  }
+
+  const rows = getGpsFixRows(context);
+  const materialized = {
+    total: rows.length,
+    candidates: buildGpsUtilityCandidateRows(rows, userState),
+    expiresAt: Date.now() + utilityCandidateQueueCacheTtlMs,
+  };
+  gpsUtilityCandidateQueueCache.set(cacheKey, materialized);
+  return materialized;
+}
+
+function buildGpsUtilityCandidateRows(rows, userState, excludedAssetIds = new Set()) {
+  const candidates = [];
+  for (const row of rows) {
+    if (excludedAssetIds.has(row.assetId)) {
+      continue;
+    }
+    if (
+      (userState.applied && userState.applied[row.assetId]) ||
+      (userState.skipped && userState.skipped[row.assetId]) ||
+      shouldExcludeFailedUtilityCandidate(userState, row.assetId)
+    ) {
+      continue;
+    }
+    candidates.push(row);
+  }
+  return candidates;
+}
+
+function markGpsUtilityQueueAssetProcessed(context, assetId) {
+  const cacheKey = buildGpsUtilityRowsCacheKey(context);
+  const cached = gpsUtilityCandidateQueueCache.get(cacheKey);
+  if (!cached) {
+    return;
+  }
+
+  cached.candidates = cached.candidates.filter((candidate) => candidate.assetId !== assetId);
+  cached.expiresAt = Date.now() + utilityCandidateQueueCacheTtlMs;
+}
+
+function getGpsFixRows(context) {
+  const cacheKey = buildGpsUtilityRowsCacheKey(context);
+  const cached = gpsUtilityRowsCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.rows;
+  }
+
+  const libraryPathCondition = buildLibraryPathSqlCondition(context);
+  const sql = `
+    select
+      a.id,
+      a."originalFileName",
+      a."originalPath",
+      a."fileCreatedAt",
+      a."localDateTime",
+      ae."dateTimeOriginal",
+      ae.latitude,
+      ae.longitude,
+      coalesce(ae."dateTimeOriginal", a."localDateTime", a."fileCreatedAt") as "sortDateTime"
+    from asset a
+    left join asset_exif ae on ae."assetId" = a.id
+    where a."ownerId" = ${sqlString(context.immichUserId)}
+      and a."deletedAt" is null
+      and a.type = 'IMAGE'
+      and (${libraryPathCondition})
+      and lower(a."originalFileName") ~ '\\.(jpg|jpeg|png|webp|gif|heic|heif)$'
+      and (ae.latitude is null or ae.longitude is null)
+    order by coalesce(ae."dateTimeOriginal", a."localDateTime", a."fileCreatedAt") asc nulls last, a.id asc;
+  `;
+
+  const rows = runPostgresRowsQuery(sql).map((line) => {
+    const [assetId, fileName, originalPath, fileCreatedAt, localDateTime, dateTimeOriginal, latitude, longitude, sortDateTime] = line.split('\t');
+    return {
+      assetId,
+      fileName,
+      originalPath,
+      fileCreatedAt,
+      localDateTime,
+      dateTimeOriginal,
+      latitude: parseOptionalFloat(latitude),
+      longitude: parseOptionalFloat(longitude),
+      sortDateTime,
+    };
+  });
+  gpsUtilityRowsCache.set(cacheKey, {
+    rows,
+    expiresAt: Date.now() + utilityRowsCacheTtlMs,
+  });
+  return rows;
+}
+
+function buildGpsUtilityRowsCacheKey(context) {
+  return `gps:${context.nextcloudUserId}:${context.immichUserId}`;
+}
+
+function invalidateGpsFixCaches(context) {
+  const cacheKey = buildGpsUtilityRowsCacheKey(context);
+  gpsUtilityRowsCache.delete(cacheKey);
+  gpsUtilityCandidateQueueCache.delete(cacheKey);
+}
+
+function getGpsUtilityAssetRecord(context, assetId) {
+  const libraryPathCondition = buildLibraryPathSqlCondition(context);
+  const sql = `
+    select
+      a.id,
+      a."originalFileName",
+      a."originalPath",
+      a."fileCreatedAt",
+      a."localDateTime",
+      ae."dateTimeOriginal",
+      ae.latitude,
+      ae.longitude
+    from asset a
+    left join asset_exif ae on ae."assetId" = a.id
+    where a.id = ${sqlString(assetId)}
+      and a."ownerId" = ${sqlString(context.immichUserId)}
+      and a."deletedAt" is null
+      and (${libraryPathCondition})
+    limit 1;
+  `;
+  const row = runPostgresRowsQuery(sql)[0];
+  if (!row) {
+    throw httpError(404, `Asset ${assetId} not found`);
+  }
+
+  const [id, fileName, originalPath, fileCreatedAt, localDateTime, dateTimeOriginal, latitude, longitude] = row.split('\t');
+  return {
+    assetId: id,
+    fileName,
+    originalPath,
+    fileCreatedAt,
+    localDateTime,
+    dateTimeOriginal,
+    latitude: parseOptionalFloat(latitude),
+    longitude: parseOptionalFloat(longitude),
+  };
+}
+
+function shouldOfferGpsFix(assetRecord) {
+  return !Number.isFinite(assetRecord.latitude) || !Number.isFinite(assetRecord.longitude);
+}
+
+function buildGpsFixCandidate(context, row) {
+  const siblingSuggestion = getGpsSiblingSuggestion(context, row);
+  const previousSuggestion = siblingSuggestion || getGpsNeighborSuggestion(context, row, 'previous');
+  const nextSuggestion = getGpsNeighborSuggestion(context, row, 'next');
+  const defaultSuggestion = selectDefaultGpsSuggestion(previousSuggestion, nextSuggestion);
+  const pickerDateTime = row.dateTimeOriginal || row.sortDateTime || null;
+  return {
+    assetId: row.assetId,
+    fileName: row.fileName,
+    previewUrl: `/api/assets/${row.assetId}/thumbnail?size=preview`,
+    currentDateTimeIso: row.dateTimeOriginal || row.sortDateTime || null,
+    currentDateTimeLocal: formatUtilityDateTime(row.dateTimeOriginal || row.sortDateTime),
+    currentDatePickerDate: formatUtilityPickerDate(pickerDateTime),
+    currentDatePickerTime: formatUtilityPickerTime(pickerDateTime),
+    currentLatitude: Number.isFinite(row.latitude) ? row.latitude : null,
+    currentLongitude: Number.isFinite(row.longitude) ? row.longitude : null,
+    previousSuggestion,
+    nextSuggestion,
+    defaultSuggestion,
+  };
+}
+
+function getGpsSiblingSuggestion(context, row) {
+  const rowSortDateTime = row.dateTimeOriginal || row.sortDateTime || row.localDateTime || row.fileCreatedAt || null;
+  const referenceGroupKey = buildReferenceGroupKey(row.fileName);
+  if (!rowSortDateTime || !referenceGroupKey) {
+    return null;
+  }
+
+  const libraryPathCondition = buildLibraryPathSqlCondition(context);
+  const sql = `
+    select
+      a.id,
+      a."originalFileName",
+      coalesce(ae."dateTimeOriginal", a."localDateTime", a."fileCreatedAt") as "sortDateTime",
+      ae.latitude,
+      ae.longitude
+    from asset a
+    join asset_exif ae on ae."assetId" = a.id
+    where a."ownerId" = ${sqlString(context.immichUserId)}
+      and a."deletedAt" is null
+      and a.type = 'IMAGE'
+      and (${libraryPathCondition})
+      and a.id <> ${sqlString(row.assetId)}
+      and ae.latitude is not null
+      and ae.longitude is not null
+      and coalesce(ae."dateTimeOriginal", a."localDateTime", a."fileCreatedAt") is not null
+      and ${buildReferenceGroupKeySql('a."originalFileName"')} = ${sqlString(referenceGroupKey)}
+    order by abs(extract(epoch from (coalesce(ae."dateTimeOriginal", a."localDateTime", a."fileCreatedAt") - ${sqlString(rowSortDateTime)}::timestamptz))) asc,
+      length(a."originalFileName") asc,
+      a.id asc
+    limit 1;
+  `;
+  const result = runPostgresRowsQuery(sql)[0];
+  if (!result) {
+    return null;
+  }
+
+  const [assetId, fileName, sortDateTime, latitude, longitude] = result.split('\t');
+  const timeDeltaMs = Math.abs(Date.parse(rowSortDateTime) - Date.parse(sortDateTime));
+  return {
+    source: 'previous',
+    assetId,
+    fileName,
+    previewUrl: `/api/assets/${assetId}/thumbnail?size=preview`,
+    dateTimeOriginal: sortDateTime,
+    dateTimeLocal: formatUtilityDateTime(sortDateTime),
+    latitude: Number(latitude),
+    longitude: Number(longitude),
+    timeDeltaMs,
+    timeDeltaLabel: formatRelativeDuration(timeDeltaMs),
+  };
+}
+
+function getGpsNeighborSuggestion(context, row, direction) {
+  const rowSortDateTime = row.dateTimeOriginal || row.sortDateTime || row.localDateTime || row.fileCreatedAt || null;
+  if (!rowSortDateTime) {
+    return null;
+  }
+
+  const comparisonOperator = direction === 'previous' ? '<' : '>';
+  const sortDirection = direction === 'previous' ? 'desc' : 'asc';
+  const libraryPathCondition = buildLibraryPathSqlCondition(context);
+  const sql = `
+    select
+      a.id,
+      a."originalFileName",
+      coalesce(ae."dateTimeOriginal", a."localDateTime", a."fileCreatedAt") as "sortDateTime",
+      ae.latitude,
+      ae.longitude
+    from asset a
+    join asset_exif ae on ae."assetId" = a.id
+    where a."ownerId" = ${sqlString(context.immichUserId)}
+      and a."deletedAt" is null
+      and a.type = 'IMAGE'
+      and (${libraryPathCondition})
+      and ae.latitude is not null
+      and ae.longitude is not null
+      and coalesce(ae."dateTimeOriginal", a."localDateTime", a."fileCreatedAt") is not null
+      and coalesce(ae."dateTimeOriginal", a."localDateTime", a."fileCreatedAt") ${comparisonOperator} ${sqlString(rowSortDateTime)}
+    order by coalesce(ae."dateTimeOriginal", a."localDateTime", a."fileCreatedAt") ${sortDirection}, a.id ${sortDirection}
+    limit 1;
+  `;
+  const result = runPostgresRowsQuery(sql)[0];
+  if (!result) {
+    return null;
+  }
+
+  const [assetId, fileName, sortDateTime, latitude, longitude] = result.split('\t');
+  const timeDeltaMs = Math.abs(Date.parse(rowSortDateTime) - Date.parse(sortDateTime));
+  return {
+    source: direction,
+    assetId,
+    fileName,
+    previewUrl: `/api/assets/${assetId}/thumbnail?size=preview`,
+    dateTimeOriginal: sortDateTime,
+    dateTimeLocal: formatUtilityDateTime(sortDateTime),
+    latitude: Number(latitude),
+    longitude: Number(longitude),
+    timeDeltaMs,
+    timeDeltaLabel: formatRelativeDuration(timeDeltaMs),
+  };
+}
+
+function buildReferenceGroupKey(fileName) {
+  const baseName = String(fileName || '')
+    .replace(/\.[^.]+$/, '')
+    .toLowerCase()
+    .trim();
+  if (!baseName) {
+    return null;
+  }
+  return baseName.replace(/(?:[ _-](?:editado|edited|edit|copy|copia|copie|final))+$/i, '');
+}
+
+function buildReferenceGroupKeySql(columnSql) {
+  return `lower(regexp_replace(regexp_replace(${columnSql}, '\\.[^.]+$', '', 'g'), '(?:[ _-](?:editado|edited|edit|copy|copia|copie|final))+$', '', 'i'))`;
+}
+
+function selectDefaultGpsSuggestion(previousSuggestion, nextSuggestion) {
+  if (previousSuggestion && nextSuggestion) {
+    return previousSuggestion.timeDeltaMs <= nextSuggestion.timeDeltaMs ? previousSuggestion : nextSuggestion;
+  }
+  return previousSuggestion || nextSuggestion || null;
+}
+
+function resolveGpsSelectionSource(candidate, latitude, longitude, requestedSource) {
+  if (requestedSource === 'previous' || requestedSource === 'next' || requestedSource === 'manual') {
+    return requestedSource;
+  }
+
+  const previous = candidate.previousSuggestion;
+  if (previous && approximatelyEqualCoordinate(previous.latitude, latitude) && approximatelyEqualCoordinate(previous.longitude, longitude)) {
+    return 'previous';
+  }
+
+  const next = candidate.nextSuggestion;
+  if (next && approximatelyEqualCoordinate(next.latitude, latitude) && approximatelyEqualCoordinate(next.longitude, longitude)) {
+    return 'next';
+  }
+
+  return 'manual';
+}
+
+function approximatelyEqualCoordinate(left, right) {
+  return Math.abs(Number(left) - Number(right)) < 0.000001;
+}
+
+function enqueueGpsExifWriteback(context, task) {
+  const queue = gpsUtilityWritebackQueues.get(context.nextcloudUserId) || [];
+  queue.push({
+    ...task,
+    nextcloudUserId: context.nextcloudUserId,
+    immichUserId: context.immichUserId,
+  });
+  gpsUtilityWritebackQueues.set(context.nextcloudUserId, queue);
+
+  let job = gpsUtilityBackgroundJobs.get(context.nextcloudUserId);
+  if (!job || job.status === 'completed' || job.status === 'failed') {
+    job = {
+      id: crypto.randomUUID(),
+      nextcloudUserId: context.nextcloudUserId,
+      immichUserId: context.immichUserId,
+      status: 'running',
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      pending: queue.length,
+      processed: 0,
+      applied: 0,
+      failed: 0,
+      lastAssetId: null,
+      lastFileName: null,
+      lastError: null,
+    };
+    gpsUtilityBackgroundJobs.set(context.nextcloudUserId, job);
+    void runGpsUtilityBackgroundJob(context.nextcloudUserId, job.id);
+  } else {
+    job.status = 'running';
+    job.finishedAt = null;
+    job.pending = queue.length;
+  }
+}
+
+function getGpsUtilityBackgroundJob(nextcloudUserId) {
+  return gpsUtilityBackgroundJobs.get(nextcloudUserId) || null;
+}
+
+function sanitizeGpsUtilityBackgroundJob(job) {
+  if (!job) {
+    return null;
+  }
+  return {
+    id: job.id,
+    status: job.status,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    pending: job.pending,
+    processed: job.processed,
+    applied: job.applied,
+    failed: job.failed,
+    lastAssetId: job.lastAssetId,
+    lastFileName: job.lastFileName,
+    lastError: job.lastError,
+  };
+}
+
+async function runGpsUtilityBackgroundJob(nextcloudUserId, jobId) {
+  const job = gpsUtilityBackgroundJobs.get(nextcloudUserId);
+  if (!job || job.id !== jobId) {
+    return;
+  }
+
+  try {
+    while (true) {
+      const queue = gpsUtilityWritebackQueues.get(nextcloudUserId) || [];
+      const task = queue.shift();
+      gpsUtilityWritebackQueues.set(nextcloudUserId, queue);
+      job.pending = queue.length;
+
+      if (!task) {
+        job.status = 'completed';
+        job.finishedAt = new Date().toISOString();
+        job.lastError = null;
+        return;
+      }
+
+      job.lastAssetId = task.assetId;
+      job.lastFileName = task.fileName;
+
+      try {
+        applyExifGps(task.originalPath, task.latitude, task.longitude, task.extension);
+        if (task.exifDateTime) {
+          applyExifDateTime(task.originalPath, task.exifDateTime, task.extension);
+        }
+        const state = loadUtilityState();
+        const userState = ensureGpsUtilityUserState(state, nextcloudUserId);
+        delete userState.failed[task.assetId];
+        saveUtilityState(state);
+
+        writeAuditEntry({
+          kind: 'utility-gps-fix-writeback-applied',
+          nextcloudUserId,
+          immichUserId: task.immichUserId,
+          assetId: task.assetId,
+          fileName: task.fileName,
+          originalPath: task.originalPath,
+          latitude: task.latitude,
+          longitude: task.longitude,
+          dateTimeOriginal: task.dateTimeOriginal,
+        });
+        job.applied += 1;
+        job.lastError = null;
+      } catch (error) {
+        const state = loadUtilityState();
+        const userState = ensureGpsUtilityUserState(state, nextcloudUserId);
+        userState.failed[task.assetId] = {
+          decidedAt: new Date().toISOString(),
+          fileName: task.fileName,
+          message: error.message,
+          latitude: task.latitude,
+          longitude: task.longitude,
+          dateTimeOriginal: task.dateTimeOriginal,
+          background: true,
+          permanent: true,
+        };
+        saveUtilityState(state);
+
+        writeAuditEntry({
+          kind: 'utility-gps-fix-writeback-error',
+          nextcloudUserId,
+          immichUserId: task.immichUserId,
+          assetId: task.assetId,
+          fileName: task.fileName,
+          originalPath: task.originalPath,
+          message: error.message,
+        });
+        job.failed += 1;
+        job.lastError = error.message;
+      }
+
+      job.processed += 1;
+    }
+  } catch (error) {
+    job.status = 'failed';
+    job.finishedAt = new Date().toISOString();
+    job.lastError = error.message;
+  }
+}
+
+function formatUtilityDateTime(value) {
+  if (!value) {
+    return 'Nema datuma';
+  }
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) {
+    return String(value);
+  }
+  return new Intl.DateTimeFormat('hr-HR', {
+    dateStyle: 'medium',
+    timeStyle: 'medium',
+    timeZone: config.utilityTimezone,
+  }).format(new Date(timestamp));
+}
+
+function formatUtilityPickerDate(value) {
+  if (!value) {
+    return '';
+  }
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) {
+    return '';
+  }
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-CA', {
+      timeZone: config.utilityTimezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    })
+      .formatToParts(new Date(timestamp))
+      .filter((item) => item.type !== 'literal')
+      .map((item) => [item.type, item.value]),
+  );
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function formatUtilityPickerTime(value) {
+  if (!value) {
+    return '';
+  }
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) {
+    return '';
+  }
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: config.utilityTimezone,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    })
+      .formatToParts(new Date(timestamp))
+      .filter((item) => item.type !== 'literal')
+      .map((item) => [item.type, item.value]),
+  );
+  return `${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function formatRelativeDuration(milliseconds) {
+  if (!Number.isFinite(milliseconds)) {
+    return '-';
+  }
+  const totalMinutes = Math.round(milliseconds / 60000);
+  if (totalMinutes < 60) {
+    return `${totalMinutes} min`;
+  }
+  const totalHours = Math.round(totalMinutes / 60);
+  if (totalHours < 48) {
+    return `${totalHours} h`;
+  }
+  const totalDays = Math.round(totalHours / 24);
+  return `${totalDays} d`;
+}
+
+function parseOptionalFloat(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 async function buildDateFromFilenameResponse(request, options = {}) {
@@ -1576,10 +2491,17 @@ function applyExifDateTime(originalPath, exifDateTime, extension) {
 }
 
 function loadUtilityState() {
-  const state = loadJson(utilityStatePath, { dateFromFilename: { users: {} } });
+  const state = loadJson(utilityStatePath, {
+    dateFromFilename: { users: {} },
+    gpsFix: { users: {} },
+  });
   const users = state.dateFromFilename && typeof state.dateFromFilename === 'object' ? state.dateFromFilename.users : {};
   state.dateFromFilename = {
     users: users && typeof users === 'object' ? users : {},
+  };
+  const gpsUsers = state.gpsFix && typeof state.gpsFix === 'object' ? state.gpsFix.users : {};
+  state.gpsFix = {
+    users: gpsUsers && typeof gpsUsers === 'object' ? gpsUsers : {},
   };
   return state;
 }
@@ -1594,6 +2516,15 @@ function ensureUtilityUserState(state, nextcloudUserId) {
   users[nextcloudUserId].applied = users[nextcloudUserId].applied && typeof users[nextcloudUserId].applied === 'object' ? users[nextcloudUserId].applied : {};
   users[nextcloudUserId].skipped = users[nextcloudUserId].skipped && typeof users[nextcloudUserId].skipped === 'object' ? users[nextcloudUserId].skipped : {};
   users[nextcloudUserId].deleted = users[nextcloudUserId].deleted && typeof users[nextcloudUserId].deleted === 'object' ? users[nextcloudUserId].deleted : {};
+  users[nextcloudUserId].failed = users[nextcloudUserId].failed && typeof users[nextcloudUserId].failed === 'object' ? users[nextcloudUserId].failed : {};
+  return users[nextcloudUserId];
+}
+
+function ensureGpsUtilityUserState(state, nextcloudUserId) {
+  const users = state.gpsFix.users;
+  users[nextcloudUserId] = users[nextcloudUserId] || { applied: {}, skipped: {}, failed: {} };
+  users[nextcloudUserId].applied = users[nextcloudUserId].applied && typeof users[nextcloudUserId].applied === 'object' ? users[nextcloudUserId].applied : {};
+  users[nextcloudUserId].skipped = users[nextcloudUserId].skipped && typeof users[nextcloudUserId].skipped === 'object' ? users[nextcloudUserId].skipped : {};
   users[nextcloudUserId].failed = users[nextcloudUserId].failed && typeof users[nextcloudUserId].failed === 'object' ? users[nextcloudUserId].failed : {};
   return users[nextcloudUserId];
 }

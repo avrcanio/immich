@@ -98,6 +98,12 @@ services:
       - traefik.http.routers.immich-exifdatefix-api.tls=true
       - traefik.http.routers.immich-exifdatefix-api.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-cloudflare}
       - traefik.http.services.immich-exifdatefix-api.loadbalancer.server.port=8091
+      - traefik.http.routers.immich-exifgpsfix-api.rule=Host(`${IMMICH_DOMAIN}`) && PathPrefix(`/utilities/exifgpsfix/api`)
+      - traefik.http.routers.immich-exifgpsfix-api.priority=100
+      - traefik.http.routers.immich-exifgpsfix-api.entrypoints=websecure
+      - traefik.http.routers.immich-exifgpsfix-api.tls=true
+      - traefik.http.routers.immich-exifgpsfix-api.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-cloudflare}
+      - traefik.http.services.immich-exifgpsfix-api.loadbalancer.server.port=8091
 
   immich-machine-learning:
     container_name: immich_machine_learning

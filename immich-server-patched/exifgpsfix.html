@@ -1,0 +1,1050 @@
+<!doctype html>
+<html lang="hr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>EXIF GPS Fix</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      crossorigin=""
+    />
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f7fb;
+        --panel: #ffffff;
+        --panel-muted: #f8fafc;
+        --line: #e2e8f0;
+        --text: #0f172a;
+        --muted: #64748b;
+        --accent: #4250f4;
+        --accent-soft: #eef2ff;
+        --accent-strong: #3343e6;
+        --success: #0f766e;
+        --danger: #b42318;
+        --shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        font-family: Inter, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(66, 80, 244, 0.08), transparent 24%),
+          radial-gradient(circle at top right, rgba(15, 118, 110, 0.06), transparent 22%),
+          var(--bg);
+        color: var(--text);
+        min-height: 100vh;
+      }
+
+      .shell {
+        width: min(1420px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 28px 0 40px;
+      }
+
+      .hero {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 24px;
+      }
+
+      .eyebrow {
+        margin: 0 0 10px;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--accent);
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(30px, 5vw, 48px);
+        line-height: 1.04;
+      }
+
+      .lead {
+        margin: 12px 0 0;
+        max-width: 72ch;
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1.65;
+      }
+
+      .queue-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 16px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.8);
+        color: var(--muted);
+        font-size: 14px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: minmax(340px, 0.95fr) minmax(460px, 1.05fr);
+        gap: 24px;
+      }
+
+      .column {
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        box-shadow: var(--shadow);
+      }
+
+      .preview-card {
+        overflow: hidden;
+      }
+
+      .preview-frame {
+        min-height: 560px;
+        background: linear-gradient(180deg, #edf2ff 0%, #f8fafc 100%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 18px;
+      }
+
+      .preview-frame img {
+        width: 100%;
+        max-height: 524px;
+        object-fit: contain;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.72);
+      }
+
+      .preview-meta {
+        padding: 18px 20px 20px;
+        border-top: 1px solid var(--line);
+      }
+
+      .meta-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .meta-block {
+        padding: 14px 16px;
+        border-radius: 16px;
+        background: var(--panel-muted);
+        border: 1px solid var(--line);
+      }
+
+      .meta-label {
+        display: block;
+        margin-bottom: 8px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+
+      .meta-value {
+        font-size: 15px;
+        line-height: 1.5;
+        word-break: break-word;
+      }
+
+      .stack {
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+        padding: 22px;
+      }
+
+      .section-title {
+        margin: 0 0 12px;
+        font-size: 15px;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+      }
+
+      .section-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .section-header .section-title {
+        margin: 0;
+      }
+
+      .suggestions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .suggestion {
+        border: 1px solid var(--line);
+        background: var(--panel-muted);
+        border-radius: 18px;
+        padding: 14px;
+        cursor: pointer;
+        transition: border-color 140ms ease, background 140ms ease, transform 140ms ease, box-shadow 140ms ease;
+      }
+
+      .suggestion:hover {
+        transform: translateY(-1px);
+        border-color: #c7d2fe;
+      }
+
+      .suggestion.selected {
+        border-color: var(--accent);
+        background: var(--accent-soft);
+        box-shadow: 0 0 0 1px rgba(66, 80, 244, 0.14);
+      }
+
+      .suggestion.empty {
+        cursor: default;
+        color: var(--muted);
+      }
+
+      .suggestion.empty:hover {
+        transform: none;
+        border-color: var(--line);
+      }
+
+      .suggestion img {
+        width: 100%;
+        height: 160px;
+        object-fit: cover;
+        border-radius: 12px;
+        background: #e2e8f0;
+        margin-bottom: 12px;
+      }
+
+      .suggestion-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 10px;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      .badge {
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(66, 80, 244, 0.12);
+        color: var(--accent);
+        font-size: 11px;
+        font-weight: 800;
+      }
+
+      .suggestion-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .strong {
+        color: var(--text);
+        font-weight: 700;
+      }
+
+      #map {
+        width: 100%;
+        height: 360px;
+        border-radius: 18px;
+        border: 1px solid var(--line);
+        overflow: hidden;
+      }
+
+      .input-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .field label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+      }
+
+      .field input {
+        width: 100%;
+        padding: 13px 14px;
+        border-radius: 14px;
+        border: 1px solid var(--line);
+        background: #fff;
+        color: var(--text);
+        font: inherit;
+      }
+
+      .field input:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(66, 80, 244, 0.12);
+      }
+
+      .helper {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .helper-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-top: 12px;
+      }
+
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      button {
+        appearance: none;
+        border: 0;
+        border-radius: 999px;
+        padding: 13px 18px;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+        transition: transform 140ms ease, opacity 140ms ease, background 140ms ease;
+      }
+
+      button:hover:enabled {
+        transform: translateY(-1px);
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: wait;
+      }
+
+      .btn-primary {
+        background: var(--accent);
+        color: #fff;
+      }
+
+      .btn-primary:hover:enabled {
+        background: var(--accent-strong);
+      }
+
+      .btn-secondary {
+        background: #eef2f7;
+        color: var(--text);
+        border: 1px solid var(--line);
+      }
+
+      .icon-button {
+        width: 38px;
+        height: 38px;
+        padding: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+      }
+
+      .icon-button svg {
+        width: 18px;
+        height: 18px;
+      }
+
+      .btn-danger {
+        background: #fff1f2;
+        color: var(--danger);
+        border: 1px solid rgba(180, 35, 24, 0.16);
+      }
+
+      .status {
+        min-height: 22px;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.5;
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      .status.success {
+        color: var(--success);
+      }
+
+      .empty {
+        padding: 80px 28px;
+        text-align: center;
+      }
+
+      .empty h2 {
+        margin: 0 0 8px;
+        font-size: 28px;
+      }
+
+      .empty p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1.7;
+      }
+
+      @media (max-width: 1120px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 760px) {
+        .hero {
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .suggestions,
+        .input-grid,
+        .meta-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .stack {
+          padding: 18px;
+        }
+
+        .preview-frame {
+          min-height: 380px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Immich Utility</p>
+          <h1>EXIF GPS Fix</h1>
+          <p class="lead">
+            Utility pronalazi slike bez GPS lokacije, traži najbližu prethodnu i sljedeću sliku
+            koje već imaju GPS i predlaže ti najvjerojatniju lokaciju. Po potrebi možeš ručno
+            kliknuti novu lokaciju na karti ili upisati koordinate.
+          </p>
+        </div>
+        <div class="queue-pill" id="queueSummary">Učitavam red...</div>
+      </section>
+
+      <section class="layout" id="appLayout" hidden>
+        <div class="column">
+          <article class="card preview-card">
+            <div class="preview-frame">
+              <img id="assetPreview" alt="Pregled asseta" />
+            </div>
+            <div class="preview-meta">
+              <div class="meta-grid">
+                <div class="meta-block">
+                  <span class="meta-label">Datoteka</span>
+                  <div class="meta-value" id="fileName">-</div>
+                </div>
+                <div class="meta-block">
+                  <span class="meta-label">Vrijeme slike</span>
+                  <div class="meta-value" id="currentDate">-</div>
+                </div>
+                <div class="meta-block">
+                  <span class="meta-label">Trenutni GPS</span>
+                  <div class="meta-value" id="currentGps">Nema GPS-a</div>
+                </div>
+                <div class="meta-block">
+                  <span class="meta-label">Status reda</span>
+                  <div class="meta-value" id="queueStatus">-</div>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <div class="column">
+          <article class="card">
+            <div class="stack">
+              <section>
+                <div class="section-header">
+                  <h2 class="section-title">Reference prije i poslije</h2>
+                  <button class="btn-secondary icon-button" id="refreshReferencesButton" type="button" title="Refresh">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                      <path d="M21 3v6h-6" />
+                    </svg>
+                  </button>
+                </div>
+                <div class="suggestions">
+                  <article class="suggestion" id="previousSuggestion"></article>
+                  <article class="suggestion" id="nextSuggestion"></article>
+                </div>
+              </section>
+
+              <section>
+                <h2 class="section-title">Odabrana lokacija</h2>
+                <div id="map"></div>
+              </section>
+
+              <section>
+                <div class="input-grid">
+                  <div class="field">
+                    <label for="latitudeInput">Zemljopisna širina</label>
+                    <input id="latitudeInput" type="number" step="any" inputmode="decimal" />
+                  </div>
+                  <div class="field">
+                    <label for="longitudeInput">Zemljopisna dužina</label>
+                    <input id="longitudeInput" type="number" step="any" inputmode="decimal" />
+                  </div>
+                  <div class="field">
+                    <label for="dateInput">Datum slike</label>
+                    <input id="dateInput" type="date" />
+                  </div>
+                  <div class="field">
+                    <label for="timeInput">Vrijeme slike</label>
+                    <input id="timeInput" type="time" step="1" />
+                  </div>
+                </div>
+                <div class="helper-row">
+                  <p class="helper" id="selectionSummary">
+                    Klikni jednu od referenci ili odaberi potpuno novu lokaciju direktno na karti.
+                  </p>
+                </div>
+              </section>
+
+              <section class="actions">
+                <button class="btn-primary" id="applyButton">Apply GPS</button>
+                <button class="btn-secondary" id="skipButton">Skip</button>
+                <button class="btn-danger" id="deleteButton">Delete</button>
+              </section>
+
+              <div class="status" id="statusMessage"></div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="card empty" id="emptyState" hidden>
+        <h2>Nema više kandidata</h2>
+        <p>
+          Trenutno nema slika bez GPS lokacije koje čekaju ručni review u ovom utilityju.
+        </p>
+      </section>
+    </main>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+    <script>
+      const state = {
+        candidate: null,
+        selectedSource: null,
+        busy: false,
+        map: null,
+        tileLayer: null,
+        selectedMarker: null,
+        previousMarker: null,
+        nextMarker: null,
+      };
+
+      const elements = {
+        appLayout: document.getElementById('appLayout'),
+        emptyState: document.getElementById('emptyState'),
+        assetPreview: document.getElementById('assetPreview'),
+        fileName: document.getElementById('fileName'),
+        currentDate: document.getElementById('currentDate'),
+        currentGps: document.getElementById('currentGps'),
+        queueSummary: document.getElementById('queueSummary'),
+        queueStatus: document.getElementById('queueStatus'),
+        previousSuggestion: document.getElementById('previousSuggestion'),
+        nextSuggestion: document.getElementById('nextSuggestion'),
+        refreshReferencesButton: document.getElementById('refreshReferencesButton'),
+        latitudeInput: document.getElementById('latitudeInput'),
+        longitudeInput: document.getElementById('longitudeInput'),
+        dateInput: document.getElementById('dateInput'),
+        timeInput: document.getElementById('timeInput'),
+        selectionSummary: document.getElementById('selectionSummary'),
+        applyButton: document.getElementById('applyButton'),
+        skipButton: document.getElementById('skipButton'),
+        deleteButton: document.getElementById('deleteButton'),
+        statusMessage: document.getElementById('statusMessage'),
+      };
+
+      function formatCoordinate(value) {
+        return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(6) : '-';
+      }
+
+      function buildGpsLine(latitude, longitude) {
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+          return 'Nema GPS-a';
+        }
+        return `${formatCoordinate(latitude)}, ${formatCoordinate(longitude)}`;
+      }
+
+      function setStatus(message = '', kind = '') {
+        elements.statusMessage.textContent = message;
+        elements.statusMessage.className = `status${kind ? ` ${kind}` : ''}`;
+      }
+
+      function setBusy(isBusy) {
+        state.busy = isBusy;
+        elements.applyButton.disabled = isBusy;
+        elements.skipButton.disabled = isBusy;
+        elements.deleteButton.disabled = isBusy;
+        elements.refreshReferencesButton.disabled = isBusy;
+        elements.latitudeInput.disabled = isBusy;
+        elements.longitudeInput.disabled = isBusy;
+        elements.dateInput.disabled = isBusy;
+        elements.timeInput.disabled = isBusy;
+      }
+
+      async function request(path, options = {}) {
+        const response = await fetch(path, {
+          ...options,
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(options.headers || {}),
+          },
+        });
+
+        if (response.status === 401) {
+          window.location.href = '/auth/login';
+          return null;
+        }
+
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.message || 'Utility request failed');
+        }
+        return payload;
+      }
+
+      function ensureMap() {
+        if (state.map || !window.L) {
+          return;
+        }
+
+        state.map = L.map('map', {
+          zoomControl: true,
+          attributionControl: true,
+        }).setView([45.815399, 15.966568], 7);
+
+        state.tileLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap contributors',
+        }).addTo(state.map);
+
+        state.map.on('click', (event) => {
+          if (state.busy || !state.candidate) {
+            return;
+          }
+          setSelectedLocation(event.latlng.lat, event.latlng.lng, 'manual');
+        });
+      }
+
+      function updateMapMarkers() {
+        ensureMap();
+        if (!state.map) {
+          return;
+        }
+
+        for (const markerName of ['previousMarker', 'nextMarker', 'selectedMarker']) {
+          if (state[markerName]) {
+            state.map.removeLayer(state[markerName]);
+            state[markerName] = null;
+          }
+        }
+
+        const candidate = state.candidate;
+        if (!candidate) {
+          return;
+        }
+
+        const bounds = [];
+        const previous = candidate.previousSuggestion;
+        if (previous) {
+          state.previousMarker = L.circleMarker([previous.latitude, previous.longitude], {
+            radius: 8,
+            color: '#4250f4',
+            weight: 2,
+            fillColor: '#4250f4',
+            fillOpacity: 0.35,
+          }).addTo(state.map).bindTooltip('Prethodna referenca');
+          bounds.push([previous.latitude, previous.longitude]);
+        }
+
+        const next = candidate.nextSuggestion;
+        if (next) {
+          state.nextMarker = L.circleMarker([next.latitude, next.longitude], {
+            radius: 8,
+            color: '#0f766e',
+            weight: 2,
+            fillColor: '#0f766e',
+            fillOpacity: 0.35,
+          }).addTo(state.map).bindTooltip('Sljedeća referenca');
+          bounds.push([next.latitude, next.longitude]);
+        }
+
+        const latitude = Number.parseFloat(elements.latitudeInput.value);
+        const longitude = Number.parseFloat(elements.longitudeInput.value);
+        if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+          state.selectedMarker = L.marker([latitude, longitude]).addTo(state.map).bindTooltip('Odabrana lokacija');
+          bounds.push([latitude, longitude]);
+        }
+
+        if (bounds.length === 1) {
+          state.map.setView(bounds[0], 13);
+        } else if (bounds.length > 1) {
+          state.map.fitBounds(bounds, { padding: [24, 24] });
+        }
+      }
+
+      function renderSuggestion(element, suggestion, title, isSelected) {
+        if (!suggestion) {
+          element.className = 'suggestion empty';
+          element.innerHTML = `
+            <div class="suggestion-label">${title}</div>
+            <div class="suggestion-list">
+              <div>Nema pronađene reference s GPS-om.</div>
+            </div>
+          `;
+          return;
+        }
+
+        const badge = suggestion.source === state.candidate?.defaultSuggestion?.source
+          ? '<span class="badge">Default</span>'
+          : '';
+
+        element.className = `suggestion${isSelected ? ' selected' : ''}`;
+        element.innerHTML = `
+          <div class="suggestion-label">${title} ${badge}</div>
+          <img src="${suggestion.previewUrl}" alt="${suggestion.fileName}" />
+          <div class="suggestion-list">
+            <div class="strong">${suggestion.fileName}</div>
+            <div>${suggestion.dateTimeLocal || '-'}</div>
+            <div>GPS: ${buildGpsLine(suggestion.latitude, suggestion.longitude)}</div>
+            <div>Udaljenost: ${suggestion.timeDeltaLabel}</div>
+          </div>
+        `;
+      }
+
+      function updateSelectionSummary() {
+        const candidate = state.candidate;
+        if (!candidate) {
+          elements.selectionSummary.textContent = '';
+          return;
+        }
+
+        if (state.selectedSource === 'previous' && candidate.previousSuggestion) {
+          elements.selectionSummary.textContent =
+            `Odabrana je prethodna referenca: ${candidate.previousSuggestion.fileName}.`;
+          return;
+        }
+
+        if (state.selectedSource === 'next' && candidate.nextSuggestion) {
+          elements.selectionSummary.textContent =
+            `Odabrana je sljedeća referenca: ${candidate.nextSuggestion.fileName}.`;
+          return;
+        }
+
+        if (state.selectedSource === 'manual') {
+          elements.selectionSummary.textContent =
+            'Odabrana je ručna lokacija. Klik na kartu ili izmjena polja odmah postavlja manual mode.';
+          return;
+        }
+
+        elements.selectionSummary.textContent =
+          'Klikni jednu od referenci ili odaberi potpuno novu lokaciju direktno na karti.';
+      }
+
+      function setSelectedLocation(latitude, longitude, source) {
+        elements.latitudeInput.value = Number.isFinite(latitude) ? latitude : '';
+        elements.longitudeInput.value = Number.isFinite(longitude) ? longitude : '';
+        state.selectedSource = source;
+        renderSuggestionsOnly();
+        updateSelectionSummary();
+        updateMapMarkers();
+      }
+
+      function renderSuggestionsOnly() {
+        const candidate = state.candidate;
+        renderSuggestion(
+          elements.previousSuggestion,
+          candidate?.previousSuggestion || null,
+          'Prethodna referenca',
+          state.selectedSource === 'previous',
+        );
+        renderSuggestion(
+          elements.nextSuggestion,
+          candidate?.nextSuggestion || null,
+          'Sljedeća referenca',
+          state.selectedSource === 'next',
+        );
+      }
+
+      function render(payload) {
+        const candidate = payload?.candidate || null;
+        state.candidate = candidate;
+
+        const status = payload?.status || {};
+        const summaryParts = [];
+        if (typeof status.remaining === 'number') summaryParts.push(`Preostalo ${status.remaining}`);
+        if (typeof status.applied === 'number') summaryParts.push(`Postavljeno ${status.applied}`);
+        if (typeof status.skipped === 'number') summaryParts.push(`Preskočeno ${status.skipped}`);
+        if (typeof status.failed === 'number') summaryParts.push(`Greške ${status.failed}`);
+        elements.queueSummary.textContent = summaryParts.join(' · ') || 'Nema statusa';
+        elements.queueStatus.textContent =
+          `Preostalo: ${status.remaining ?? '-'} · Ukupno: ${status.total ?? '-'} · Postavljeno: ${status.applied ?? '-'} · Preskočeno: ${status.skipped ?? '-'} · Greške writebacka: ${status.failed ?? '-'}`;
+
+        if (!candidate) {
+          elements.appLayout.hidden = true;
+          elements.emptyState.hidden = false;
+          return;
+        }
+
+        elements.emptyState.hidden = true;
+        elements.appLayout.hidden = false;
+        elements.assetPreview.src = candidate.previewUrl;
+        elements.fileName.textContent = candidate.fileName || '-';
+        elements.currentDate.textContent = candidate.currentDateTimeLocal || 'Nema datuma';
+        elements.currentGps.textContent = buildGpsLine(candidate.currentLatitude, candidate.currentLongitude);
+        elements.dateInput.value = candidate.currentDatePickerDate || '';
+        elements.timeInput.value = candidate.currentDatePickerTime || '';
+
+        renderSuggestionsOnly();
+
+        const defaultSuggestion = candidate.defaultSuggestion;
+        if (defaultSuggestion) {
+          setSelectedLocation(defaultSuggestion.latitude, defaultSuggestion.longitude, defaultSuggestion.source);
+        } else {
+          setSelectedLocation(candidate.currentLatitude, candidate.currentLongitude, 'manual');
+        }
+
+        renderBackgroundJob(payload?.job || null);
+      }
+
+      function renderBackgroundJob(job) {
+        if (!job) {
+          return;
+        }
+        const parts = [
+          `Writeback: ${job.status}`,
+          `Pending: ${job.pending}`,
+          `Processed: ${job.processed}`,
+          `Applied: ${job.applied}`,
+          `Errors: ${job.failed}`,
+        ];
+        if (!state.busy) {
+          setStatus(parts.join(' · '), job.failed > 0 ? 'error' : '');
+        }
+      }
+
+      async function loadNext(message = '') {
+        setBusy(true);
+        setStatus(message);
+        try {
+          const payload = await request('/utilities/exifgpsfix/api/next');
+          if (payload) {
+            render(payload);
+          }
+          if (!payload?.job) {
+            setStatus('');
+          }
+        } catch (error) {
+          setStatus(error.message, 'error');
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function refreshReferences() {
+        if (!state.candidate || state.busy) {
+          return;
+        }
+        setBusy(true);
+        setStatus('Osvjezavam reference...');
+        try {
+          const payload = await request(`/utilities/exifgpsfix/api/refresh?assetId=${encodeURIComponent(state.candidate.assetId)}`);
+          if (payload) {
+            render(payload);
+          }
+          setStatus('Reference su osvjezene.', 'success');
+        } catch (error) {
+          setStatus(error.message, 'error');
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function submitSkip() {
+        if (!state.candidate || state.busy) {
+          return;
+        }
+        setBusy(true);
+        setStatus('Preskačem asset...');
+        try {
+          const payload = await request('/utilities/exifgpsfix/api/skip', {
+            method: 'POST',
+            body: JSON.stringify({ assetId: state.candidate.assetId }),
+          });
+          if (payload) {
+            render(payload);
+          }
+          setStatus('Asset je preskočen.');
+        } catch (error) {
+          setStatus(error.message, 'error');
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function submitApply() {
+        if (!state.candidate || state.busy) {
+          return;
+        }
+
+        const latitude = Number.parseFloat(elements.latitudeInput.value);
+        const longitude = Number.parseFloat(elements.longitudeInput.value);
+        const manualDate = elements.dateInput.value || null;
+        const manualTime = elements.timeInput.value || null;
+        if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+          setStatus('Unesi valjanu zemljopisnu širinu i dužinu.', 'error');
+          return;
+        }
+        if ((manualDate && !manualTime) || (!manualDate && manualTime)) {
+          setStatus('Ako mijenjas datum slike, unesi i datum i vrijeme.', 'error');
+          return;
+        }
+
+        setBusy(true);
+        setStatus('Upisujem GPS i po potrebi datum/vrijeme u Immich te pokrećem EXIF writeback...');
+        try {
+          const payload = await request('/utilities/exifgpsfix/api/apply', {
+            method: 'POST',
+            body: JSON.stringify({
+              assetId: state.candidate.assetId,
+              latitude,
+              longitude,
+              source: state.selectedSource || 'manual',
+              manualDate,
+              manualTime,
+            }),
+          });
+          if (payload) {
+            render(payload);
+          }
+          setStatus('GPS je postavljen. File writeback je prebačen u pozadinu.', 'success');
+        } catch (error) {
+          setStatus(error.message, 'error');
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function submitDelete() {
+        if (!state.candidate || state.busy) {
+          return;
+        }
+
+        setBusy(true);
+        setStatus('Šaljem asset u trash...');
+        try {
+          const payload = await request('/utilities/exifgpsfix/api/delete', {
+            method: 'POST',
+            body: JSON.stringify({ assetId: state.candidate.assetId }),
+          });
+          if (payload) {
+            render(payload);
+          }
+          setStatus('Asset je prebačen u trash.', 'success');
+        } catch (error) {
+          setStatus(error.message, 'error');
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function refreshBackgroundStatus() {
+        try {
+          const payload = await request('/utilities/exifgpsfix/api/background-status');
+          if (payload?.job) {
+            renderBackgroundJob(payload.job);
+          }
+        } catch (error) {
+        }
+      }
+
+      elements.previousSuggestion.addEventListener('click', () => {
+        if (state.busy || !state.candidate?.previousSuggestion) {
+          return;
+        }
+        const suggestion = state.candidate.previousSuggestion;
+        setSelectedLocation(suggestion.latitude, suggestion.longitude, 'previous');
+      });
+
+      elements.nextSuggestion.addEventListener('click', () => {
+        if (state.busy || !state.candidate?.nextSuggestion) {
+          return;
+        }
+        const suggestion = state.candidate.nextSuggestion;
+        setSelectedLocation(suggestion.latitude, suggestion.longitude, 'next');
+      });
+
+      elements.latitudeInput.addEventListener('input', () => {
+        state.selectedSource = 'manual';
+        renderSuggestionsOnly();
+        updateSelectionSummary();
+        updateMapMarkers();
+      });
+
+      elements.longitudeInput.addEventListener('input', () => {
+        state.selectedSource = 'manual';
+        renderSuggestionsOnly();
+        updateSelectionSummary();
+        updateMapMarkers();
+      });
+
+      elements.applyButton.addEventListener('click', submitApply);
+      elements.skipButton.addEventListener('click', submitSkip);
+      elements.deleteButton.addEventListener('click', submitDelete);
+      elements.refreshReferencesButton.addEventListener('click', refreshReferences);
+
+      ensureMap();
+      loadNext('Učitavam prvi GPS kandidat...');
+      setInterval(refreshBackgroundStatus, 4000);
+    </script>
+  </body>
+</html>

@@ -2,6 +2,7 @@ ARG IMMICH_VERSION=v2
 FROM ghcr.io/immich-app/immich-server:${IMMICH_VERSION}
 
 COPY exifdatefix.html /build/www/exifdatefix.html
+COPY exifgpsfix.html /build/www/exifgpsfix.html
 
 # Disable motion-photo extraction to avoid noisy ffprobe errors on certain
 # externally indexed Android/Google Photos JPEGs. Normal asset import,
@@ -52,7 +53,7 @@ patchFile(
 patchFile(
   '/usr/src/app/server/dist/app.common.js',
   `    if ((0, node_fs_1.existsSync)(resourcePaths.web.root)) {\n        app.use((0, sirv_1.default)(resourcePaths.web.root, {\n            etag: true,\n            gzip: true,\n            brotli: true,\n            extensions: [],\n            setHeaders: (res, pathname) => {\n                if (pathname.startsWith(\`/_app/immutable\`) && res.statusCode === 200) {\n                    res.setHeader('cache-control', 'public,max-age=31536000,immutable');\n                }\n            },\n        }));\n    }`,
-  `    const exifDateFixPagePath = \`\${resourcePaths.web.root}/exifdatefix.html\`;\n    const exifDateFixApiPrefix = '/utilities/exifdatefix/api';\n    const mediaOperationsBaseUrl = (process.env.MEDIA_OPS_INTERNAL_URL || 'http://media-operations:8091').replace(/\\/$/, '');\n    const internalProxySecret = process.env.IMMICH_EVENT_WEBHOOK_SECRET || '';\n    const expressApp = app.getHttpAdapter().getInstance();\n    expressApp.get(['/utilities/exifdatefix', '/utilities/exifdatefix/'], (req, res, next) => {\n        if (!(0, node_fs_1.existsSync)(exifDateFixPagePath)) {\n            return next();\n        }\n        res.setHeader('cache-control', 'no-store');\n        return res.sendFile(exifDateFixPagePath);\n    });\n    expressApp.use(exifDateFixApiPrefix, async (req, res, next) => {\n        try {\n            const suffix = req.originalUrl.startsWith(exifDateFixApiPrefix)\n                ? req.originalUrl.slice(exifDateFixApiPrefix.length)\n                : '';\n            const targetUrl = \`\${mediaOperationsBaseUrl}/utility/exifdatefix/api\${suffix}\`;\n            const headers = {};\n            for (const [key, value] of Object.entries(req.headers)) {\n                if (value == null) {\n                    continue;\n                }\n                const lowerKey = key.toLowerCase();\n                if (lowerKey === 'host' || lowerKey === 'content-length' || lowerKey === 'connection') {\n                    continue;\n                }\n                headers[key] = Array.isArray(value) ? value.join(', ') : value;\n            }\n            if (req.headers.cookie && internalProxySecret) {\n                const authResponse = await fetch('http://127.0.0.1:2283/api/users/me', {\n                    method: 'GET',\n                    headers: {\n                        accept: 'application/json',\n                        cookie: Array.isArray(req.headers.cookie) ? req.headers.cookie.join('; ') : req.headers.cookie,\n                    },\n                });\n                const authPayload = authResponse.ok ? await authResponse.json().catch(() => null) : null;\n                if (authPayload?.id) {\n                    headers['x-immich-user-id'] = authPayload.id;\n                    headers['x-media-ops-proxy-secret'] = internalProxySecret;\n                }\n            }\n            const init = {\n                method: req.method,\n                headers,\n                redirect: 'manual',\n            };\n            if (req.method !== 'GET' && req.method !== 'HEAD') {\n                init.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body ?? {});\n            }\n            const response = await fetch(targetUrl, init);\n            res.status(response.status);\n            response.headers.forEach((value, key) => {\n                const lowerKey = key.toLowerCase();\n                if (lowerKey === 'content-length' || lowerKey === 'transfer-encoding' || lowerKey === 'connection' || lowerKey === 'content-encoding') {\n                    return;\n                }\n                res.setHeader(key, value);\n            });\n            return res.send(Buffer.from(await response.arrayBuffer()));\n        }\n        catch (error) {\n            logger.warn(\`Failed to proxy EXIF date fix API request: \${error.message}\`);\n            return next(error);\n        }\n    });\n    if ((0, node_fs_1.existsSync)(resourcePaths.web.root)) {\n        app.use((0, sirv_1.default)(resourcePaths.web.root, {\n            etag: true,\n            gzip: true,\n            brotli: true,\n            extensions: [],\n            setHeaders: (res, pathname) => {\n                if (pathname.startsWith(\`/_app/immutable\`) && res.statusCode === 200) {\n                    res.setHeader('cache-control', 'public,max-age=31536000,immutable');\n                }\n            },\n        }));\n    }`,
+  `    const exifDateFixPagePath = \`\${resourcePaths.web.root}/exifdatefix.html\`;\n    const exifGpsFixPagePath = \`\${resourcePaths.web.root}/exifgpsfix.html\`;\n    const mediaOperationsBaseUrl = (process.env.MEDIA_OPS_INTERNAL_URL || 'http://media-operations:8091').replace(/\\/$/, '');\n    const internalProxySecret = process.env.IMMICH_EVENT_WEBHOOK_SECRET || '';\n    const expressApp = app.getHttpAdapter().getInstance();\n    const utilityProxyDefinitions = [\n        {\n            pagePaths: ['/utilities/exifdatefix', '/utilities/exifdatefix/'],\n            pagePath: exifDateFixPagePath,\n            publicApiPrefix: '/utilities/exifdatefix/api',\n            internalApiPrefix: '/utility/exifdatefix/api',\n            label: 'EXIF date fix',\n        },\n        {\n            pagePaths: ['/utilities/exifgpsfix', '/utilities/exifgpsfix/'],\n            pagePath: exifGpsFixPagePath,\n            publicApiPrefix: '/utilities/exifgpsfix/api',\n            internalApiPrefix: '/utility/exifgpsfix/api',\n            label: 'EXIF GPS fix',\n        },\n    ];\n    for (const utilityDefinition of utilityProxyDefinitions) {\n        expressApp.get(utilityDefinition.pagePaths, (req, res, next) => {\n            if (!(0, node_fs_1.existsSync)(utilityDefinition.pagePath)) {\n                return next();\n            }\n            res.setHeader('cache-control', 'no-store');\n            return res.sendFile(utilityDefinition.pagePath);\n        });\n        expressApp.use(utilityDefinition.publicApiPrefix, async (req, res, next) => {\n            try {\n                const suffix = req.originalUrl.startsWith(utilityDefinition.publicApiPrefix)\n                    ? req.originalUrl.slice(utilityDefinition.publicApiPrefix.length)\n                    : '';\n                const targetUrl = \`\${mediaOperationsBaseUrl}\${utilityDefinition.internalApiPrefix}\${suffix}\`;\n                const headers = {};\n                for (const [key, value] of Object.entries(req.headers)) {\n                    if (value == null) {\n                        continue;\n                    }\n                    const lowerKey = key.toLowerCase();\n                    if (lowerKey === 'host' || lowerKey === 'content-length' || lowerKey === 'connection') {\n                        continue;\n                    }\n                    headers[key] = Array.isArray(value) ? value.join(', ') : value;\n                }\n                if (req.headers.cookie && internalProxySecret) {\n                    const authResponse = await fetch('http://127.0.0.1:2283/api/users/me', {\n                        method: 'GET',\n                        headers: {\n                            accept: 'application/json',\n                            cookie: Array.isArray(req.headers.cookie) ? req.headers.cookie.join('; ') : req.headers.cookie,\n                        },\n                    });\n                    const authPayload = authResponse.ok ? await authResponse.json().catch(() => null) : null;\n                    if (authPayload?.id) {\n                        headers['x-immich-user-id'] = authPayload.id;\n                        headers['x-media-ops-proxy-secret'] = internalProxySecret;\n                    }\n                }\n                const init = {\n                    method: req.method,\n                    headers,\n                    redirect: 'manual',\n                };\n                if (req.method !== 'GET' && req.method !== 'HEAD') {\n                    init.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body ?? {});\n                }\n                const response = await fetch(targetUrl, init);\n                res.status(response.status);\n                response.headers.forEach((value, key) => {\n                    const lowerKey = key.toLowerCase();\n                    if (lowerKey === 'content-length' || lowerKey === 'transfer-encoding' || lowerKey === 'connection' || lowerKey === 'content-encoding') {\n                        return;\n                    }\n                    res.setHeader(key, value);\n                });\n                return res.send(Buffer.from(await response.arrayBuffer()));\n            }\n            catch (error) {\n                logger.warn(\`Failed to proxy \${utilityDefinition.label} API request: \${error.message}\`);\n                return next(error);\n            }\n        });\n    }\n    if ((0, node_fs_1.existsSync)(resourcePaths.web.root)) {\n        app.use((0, sirv_1.default)(resourcePaths.web.root, {\n            etag: true,\n            gzip: true,\n            brotli: true,\n            extensions: [],\n            setHeaders: (res, pathname) => {\n                if (pathname.startsWith(\`/_app/immutable\`) && res.statusCode === 200) {\n                    res.setHeader('cache-control', 'public,max-age=31536000,immutable');\n                }\n            },\n        }));\n    }`,
 );
 
 patchFile(
@@ -207,13 +208,13 @@ replaceEverywhere('/build/www', croatianTrashNoticeChunkName, patchedCroatianTra
 replaceEverywhere(
   '/build/www',
   'F=[{href:O.duplicatesUtility(),icon:C,label:y()(`review_duplicates`)},{href:O.largeFileUtility(),icon:w,label:y()(`review_large_files`)},{href:O.geolocationUtility(),icon:S,label:y()(`manage_geolocation`)}];',
-  'F=[{href:O.duplicatesUtility(),icon:C,label:y()(`review_duplicates`)},{href:O.largeFileUtility(),icon:w,label:y()(`review_large_files`)},{href:"/utilities/exifdatefix",icon:S,label:"EXIF Date Fix"},{href:O.geolocationUtility(),icon:S,label:y()(`manage_geolocation`)}];',
+  'F=[{href:O.duplicatesUtility(),icon:C,label:y()(`review_duplicates`)},{href:O.largeFileUtility(),icon:w,label:y()(`review_large_files`)},{href:"/utilities/exifdatefix",icon:S,label:"EXIF Date Fix"},{href:"/utilities/exifgpsfix",icon:S,label:"EXIF GPS Fix"},{href:O.geolocationUtility(),icon:S,label:y()(`manage_geolocation`)}];',
 );
 
 const utilitiesChunkPath = patchFirstMatch(
   '/build/www',
-  'F=[{href:O.duplicatesUtility(),icon:C,label:y()(`review_duplicates`)},{href:O.largeFileUtility(),icon:w,label:y()(`review_large_files`)},{href:"/utilities/exifdatefix",icon:S,label:"EXIF Date Fix"},{href:O.geolocationUtility(),icon:S,label:y()(`manage_geolocation`)}];',
-  'F=[{href:O.duplicatesUtility(),icon:C,label:y()(`review_duplicates`)},{href:O.largeFileUtility(),icon:w,label:y()(`review_large_files`)},{href:"/utilities/exifdatefix",icon:S,label:"EXIF Date Fix"},{href:O.geolocationUtility(),icon:S,label:y()(`manage_geolocation`)}];',
+  'F=[{href:O.duplicatesUtility(),icon:C,label:y()(`review_duplicates`)},{href:O.largeFileUtility(),icon:w,label:y()(`review_large_files`)},{href:"/utilities/exifdatefix",icon:S,label:"EXIF Date Fix"},{href:"/utilities/exifgpsfix",icon:S,label:"EXIF GPS Fix"},{href:O.geolocationUtility(),icon:S,label:y()(`manage_geolocation`)}];',
+  'F=[{href:O.duplicatesUtility(),icon:C,label:y()(`review_duplicates`)},{href:O.largeFileUtility(),icon:w,label:y()(`review_large_files`)},{href:"/utilities/exifdatefix",icon:S,label:"EXIF Date Fix"},{href:"/utilities/exifgpsfix",icon:S,label:"EXIF GPS Fix"},{href:O.geolocationUtility(),icon:S,label:y()(`manage_geolocation`)}];',
 );
 
 const utilitiesChunkName = utilitiesChunkPath.split('/').pop();
@@ -239,7 +240,7 @@ replaceEverywhere(
   `  </body>`,
   `    <script>
       (() => {
-        const LINK_ID = 'finestar-exifdatefix-link';
+        const LINK_ID = 'finestar-utility-links';
         const PATHS = new Set(['/utilities', '/utilities/']);
         const ensureLink = () => {
           const existing = document.getElementById(LINK_ID);
@@ -251,25 +252,37 @@ replaceEverywhere(
           if (existing) {
             return;
           }
-          const link = document.createElement('a');
-          link.id = LINK_ID;
-          link.href = '/utilities/exifdatefix';
-          link.textContent = 'EXIF Date Fix';
-          Object.assign(link.style, {
+          const container = document.createElement('div');
+          container.id = LINK_ID;
+          Object.assign(container.style, {
             position: 'fixed',
             right: '24px',
             bottom: '24px',
             zIndex: '9999',
-            padding: '12px 16px',
-            borderRadius: '999px',
-            background: '#c3562a',
-            color: '#fff8f3',
-            textDecoration: 'none',
-            fontFamily: 'Google Sans, sans-serif',
-            fontWeight: '600',
-            boxShadow: '0 10px 30px rgba(0,0,0,0.18)',
+            display: 'flex',
+            gap: '12px',
+            flexWrap: 'wrap',
+            justifyContent: 'flex-end',
           });
-          document.body.appendChild(link);
+          const makeLink = (href, text) => {
+            const link = document.createElement('a');
+            link.href = href;
+            link.textContent = text;
+            Object.assign(link.style, {
+              padding: '12px 16px',
+              borderRadius: '999px',
+              background: '#c3562a',
+              color: '#fff8f3',
+              textDecoration: 'none',
+              fontFamily: 'Google Sans, sans-serif',
+              fontWeight: '600',
+              boxShadow: '0 10px 30px rgba(0,0,0,0.18)',
+            });
+            return link;
+          };
+          container.appendChild(makeLink('/utilities/exifdatefix', 'EXIF Date Fix'));
+          container.appendChild(makeLink('/utilities/exifgpsfix', 'EXIF GPS Fix'));
+          document.body.appendChild(container);
         };
         const wrapHistory = (method) => {
           const original = history[method];

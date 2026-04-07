@@ -198,6 +198,42 @@ The service itself remains deployed with `MEDIA_OPS_DRY_RUN=true`, but the follo
   - it only proposes dates when the filename pattern is recognized with confidence
   - assets with opaque names still require manual review or another source of truth
 
+## EXIF GPS Fix Utility
+
+- The stack now also includes a dedicated EXIF GPS fix utility UI exposed at `/utilities/exifgpsfix`.
+- The GPS utility is DB-first:
+  - it reads candidate assets from Immich/Postgres
+  - it targets images where `asset_exif.latitude` or `asset_exif.longitude` is missing
+- Candidate review is user-scoped and limited to the managed library paths for the authenticated user.
+- For each candidate, the utility looks up:
+  - the nearest previous image with GPS
+  - the nearest next image with GPS
+  - a default suggestion chosen by the smaller time delta
+- Refresh behavior is now explicit for the currently open asset:
+  - the refresh button re-runs suggestion lookup for that asset
+  - it does not advance the queue
+  - it clears the GPS utility row/queue caches before rebuilding suggestions
+- Reference selection logic now handles real-world edited variants more robustly:
+  - if a filename belongs to the same normalized capture group as another asset with GPS, that sibling/original variant is preferred
+  - normalization strips common suffixes such as `-editado`, `-edited`, `-edit`, `-copy`, `-copia`, `-copie`, and `-final`
+  - if no such sibling GPS asset exists, the utility falls back to the nearest chronological GPS neighbor
+- GPS correction UI currently supports:
+  - map click to choose a manual point
+  - numeric latitude/longitude entry
+  - date picker and time picker for correcting `dateTimeOriginal` on the same screen
+  - `Apply GPS`
+  - `Skip`
+  - `Delete`
+  - refresh references button
+- Apply behavior:
+  - updates Immich asset metadata immediately
+  - can update GPS and `dateTimeOriginal` together in a single apply action
+  - enqueues background EXIF writeback for the original file
+- File-level writeback currently covers:
+  - GPS EXIF/XMP writeback via `exiftool`
+  - date/time EXIF writeback via `exiftool` when a manual date and time are provided
+- The GPS utility was exercised directly against the managed library during metadata cleanup and iterative tuning of refresh/reference behavior.
+
 ## Known Gaps
 
 - Physical folder moves are still planned operations, not live storage mutations.

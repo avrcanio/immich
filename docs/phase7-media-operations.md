@@ -217,6 +217,10 @@ The service itself remains deployed with `MEDIA_OPS_DRY_RUN=true`, but the follo
   - DJI exports where the filename is an epoch timestamp
   - `screen_...` Android exports that store an epoch timestamp at the end of the name
   - compact numeric camera names such as `20140407235852.jpg`, `2014040803738.jpg`, and `20200223125641.gif`
+  - compact underscore-separated video names such as `2017_12_25_11_58_04.mp4`
+- Real-world note from cleanup work:
+  - for `YYYY_MM_DD_HH_MM_SS` videos, the parser can recover the intended wall-clock capture time from the filename
+  - Immich/QuickTime timezone interpretation may still require final alignment in Immich metadata after file writeback
 - The utility is still intentionally conservative:
   - it only proposes dates when the filename pattern is recognized with confidence
   - assets with opaque names such as `image-<hash>.jpg` still require manual review or another source of truth

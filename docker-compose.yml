@@ -1,12 +1,63 @@
 name: immich
 
 services:
+  immich-db:
+    build:
+      context: .
+      dockerfile: Dockerfile.database
+    image: immich-db-local:18.7-bookworm-vector0.8.2-vchord1.1.1
+    platform: linux/amd64
+    container_name: immich-db
+    restart: unless-stopped
+    env_file:
+      - path: .env.database
+        required: true
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=en_US.utf8
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=vchord
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - max_connections=100
+      - -c
+      - work_mem=4MB
+      - -c
+      - TimeZone=Europe/Zagreb
+    mem_limit: 4g
+    shm_size: 1g
+    volumes:
+      - type: bind
+        source: /opt/stacks/data/immich-postgres/data-pg18
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /opt/stacks/data/backups
+        target: /backups
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - postgis
+
   immich-server:
     container_name: immich_server
     build:
       context: ./immich-server-patched
       args:
-        IMMICH_VERSION: ${IMMICH_VERSION:-v2}
+        IMMICH_VERSION: ${IMMICH_VERSION:-v3.4.2}
     volumes:
       - ${UPLOAD_LOCATION}:/data
       - /opt/stacks/nextcloud/docker-data/nextcloud/data:/external-libraries/nextcloud-data:ro
@@ -14,7 +65,10 @@ services:
     env_file:
       - .env
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      immich-db:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       disable: false
@@ -97,17 +151,18 @@ services:
       - traefik.http.routers.immich-exifdatefix-api.entrypoints=websecure
       - traefik.http.routers.immich-exifdatefix-api.tls=true
       - traefik.http.routers.immich-exifdatefix-api.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-cloudflare}
-      - traefik.http.services.immich-exifdatefix-api.loadbalancer.server.port=8091
+      - traefik.http.routers.immich-exifdatefix-api.service=immich-media-operations
       - traefik.http.routers.immich-exifgpsfix-api.rule=Host(`${IMMICH_DOMAIN}`) && PathPrefix(`/utilities/exifgpsfix/api`)
       - traefik.http.routers.immich-exifgpsfix-api.priority=100
       - traefik.http.routers.immich-exifgpsfix-api.entrypoints=websecure
       - traefik.http.routers.immich-exifgpsfix-api.tls=true
       - traefik.http.routers.immich-exifgpsfix-api.tls.certresolver=${TRAEFIK_CERT_RESOLVER:-cloudflare}
-      - traefik.http.services.immich-exifgpsfix-api.loadbalancer.server.port=8091
+      - traefik.http.routers.immich-exifgpsfix-api.service=immich-media-operations
+      - traefik.http.services.immich-media-operations.loadbalancer.server.port=8091
 
   immich-machine-learning:
     container_name: immich_machine_learning
-    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-v2}
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-v3.4.2}
     volumes:
       - model-cache:/cache
     env_file:

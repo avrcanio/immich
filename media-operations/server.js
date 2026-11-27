@@ -3920,7 +3920,9 @@ function lookupManagedSmartAlbumMemberships(ownerId, assetId) {
     select album.id, album."albumName"
     from album
     join album_asset on album_asset."albumId" = album.id
-    where album."ownerId" = ${sqlString(ownerId)}
+    join album_user on album_user."albumId" = album.id
+    where album_user."userId" = ${sqlString(ownerId)}
+      and album_user.role = 'owner'
       and album_asset."assetId" = ${sqlString(assetId)}
       and album."deletedAt" is null
       and album."albumName" in (${sqlStringList(getManagedSmartAlbumNames())});
@@ -3934,12 +3936,14 @@ function lookupManagedSmartAlbumMemberships(ownerId, assetId) {
 
 function lookupOwnedAlbumByName(ownerId, albumName) {
   const row = runPostgresQuery(`
-    select id || E'\\t' || "albumName"
+    select album.id || E'\\t' || album."albumName"
     from album
-    where "ownerId" = ${sqlString(ownerId)}
-      and "albumName" = ${sqlString(albumName)}
-      and "deletedAt" is null
-    order by "createdAt" desc
+    join album_user on album_user."albumId" = album.id
+    where album_user."userId" = ${sqlString(ownerId)}
+      and album_user.role = 'owner'
+      and album."albumName" = ${sqlString(albumName)}
+      and album."deletedAt" is null
+    order by album."createdAt" desc
     limit 1;
   `);
 
